@@ -6,9 +6,12 @@ from multi_exchange_manager import MultiExchangeManager
 
 ENABLED_EXCHANGES = ['poloniex', 'binance', 'kraken', 'kucoin']
 MIN_SURFACE_RATE = 0.0   # only fetch order books when surface profit >= this
-MIN_REAL_RATE = 0.1      # display threshold; try 0.01 to see near-misses
+SLIPPAGE_BUFFER = 0.10   # % subtracted on top of fees — L20 book walks overstate fills
+MIN_NET_RATE = 0.0       # opportunity must clear fees + slippage by at least this %
+FEE_TYPE = 'taker'       # triangular legs cross the spread, so taker fees apply
+NOTIONAL_USD = 5000      # assumed capital, for the net-profit dollar estimate
 SHOW_SCAN_SUMMARY = True
-SHOW_SCAN_DIAGNOSTICS = True  # best surface/real % per exchange each scan
+SHOW_SCAN_DIAGNOSTICS = True  # best surface/real/net % per exchange each scan
 
 
 def step_0_multi():
@@ -51,7 +54,8 @@ async def step_2_multi_async(manager, triangular_pairs):
     print("=" * 60)
 
     tasks = [
-        manager.scan_exchange_async(exchange, t_pairs, MIN_SURFACE_RATE, MIN_REAL_RATE)
+        manager.scan_exchange_async(exchange, t_pairs, MIN_SURFACE_RATE,
+                                    MIN_NET_RATE, SLIPPAGE_BUFFER, FEE_TYPE)
         for exchange, t_pairs in triangular_pairs.items()
     ]
     exchange_names = list(triangular_pairs.keys())
@@ -66,18 +70,20 @@ async def step_2_multi_async(manager, triangular_pairs):
     total_above_threshold = sum(len(opps) for opps in opportunities_by_exchange.values())
 
     for exchange, opportunities in opportunities_by_exchange.items():
-        print(f"  ✓ {exchange}: {len(opportunities)} opportunities ≥ {MIN_REAL_RATE}%")
+        print(f"  ✓ {exchange}: {len(opportunities)} opportunities (net ≥ {MIN_NET_RATE}% after fees)")
         if SHOW_SCAN_DIAGNOSTICS:
             s = stats_by_exchange[exchange]
             best_s = s['best_surface_perc']
             best_r = s['best_real_perc']
+            best_n = s.get('best_net_perc')
             best_s_str = f"{best_s:.4f}%" if best_s is not None else "n/a"
             best_r_str = f"{best_r:.4f}%" if best_r is not None else "n/a"
+            best_n_str = f"{best_n:.4f}%" if best_n is not None else "n/a"
             print(
                 f"      diag: evaluated={s['paths_evaluated']} | "
                 f"+surface={s['positive_surface']} | "
                 f"depth_checks={s['depth_checked']} | "
-                f"best surface={best_s_str} | best real={best_r_str}"
+                f"best surface={best_s_str} | best real={best_r_str} | best net={best_n_str}"
             )
             if s['missing_prices']:
                 print(f"      ⚠ {s['missing_prices']} pairs skipped (missing bid/ask)")
@@ -93,13 +99,15 @@ async def step_2_multi_async(manager, triangular_pairs):
         for exchange, opportunities in opportunities_by_exchange.items():
             for opp in opportunities:
                 surface = opp['surface_arb']
+                net_rate = opp['net_rate_perc']
+                net_usd = (net_rate / 100) * NOTIONAL_USD
                 print(f"\n{'=' * 60}")
                 print(f"💰 OPPORTUNITY #{opp_num} — {exchange.upper()}")
                 print(f"Route: {opp['contract_1']} -> {opp['contract_2']} -> {opp['contract_3']}")
                 print(f"Surface: {surface['profit_loss_perc']:.4f}% | Real: {opp['real_rate_perc']:.4f}%")
-                print(f"Profit: {opp['profit_loss']:.6f} | Direction: {surface['direction']}")
-                if 'BTC' in surface['swap_1']:
-                    print(f"Est. Profit (USD): ${opp['profit_loss'] * 76800:.2f}")
+                print(f"Fees (3 legs): -{opp['fee_perc']:.4f}% | Slippage buffer: -{opp['slippage_buffer_perc']:.4f}%")
+                print(f"NET (after fees): {net_rate:.4f}% | Direction: {surface['direction']}")
+                print(f"Est. Net Profit on ${NOTIONAL_USD:,}: ${net_usd:.2f}")
                 print(f"{'=' * 60}")
                 opp_num += 1
 
@@ -122,8 +130,9 @@ async def main_multi_async():
     print("MULTI-EXCHANGE TRIANGULAR ARBITRAGE SCANNER")
     print("=" * 60)
     print(f"Exchanges: {', '.join(e.capitalize() for e in ENABLED_EXCHANGES)}")
-    print(f"Min surface: {MIN_SURFACE_RATE}% | Min real: {MIN_REAL_RATE}%")
-    print("(Fast scans with 0 opps usually means no positive surface — order books not fetched.)")
+    print(f"Min surface: {MIN_SURFACE_RATE}% | Min NET: {MIN_NET_RATE}% "
+          f"(after {FEE_TYPE} fees + {SLIPPAGE_BUFFER}% slippage)")
+    print("(An opportunity must be profitable AFTER 3 legs of fees — raw 'real rate' is not enough.)")
     print("=" * 60)
 
     manager, tradeable_pairs, _ = step_0_multi()

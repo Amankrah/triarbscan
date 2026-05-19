@@ -6,6 +6,7 @@ from poloniex_adapter import PoloniexAdapter
 from binance_adapter import BinanceAdapter
 from kraken_adapter import KrakenAdapter
 from kucoin_adapter import KuCoinAdapter
+from fee_calculator import calculate_fee_impact
 import func_arbitrage
 
 STARTING_AMOUNTS = {"USDT": 100, "USDC": 100, "BTC": 0.05, "ETH": 0.1}
@@ -78,8 +79,14 @@ class MultiExchangeManager:
 
     async def scan_exchange_async(self, exchange: str, triangular_pairs: List[Dict],
                                    min_surface_rate: float = 0.0,
-                                   min_real_rate: float = 0.1) -> Dict:
-        """Scan one exchange; returns opportunities and per-scan diagnostics."""
+                                   min_net_rate: float = 0.0,
+                                   slippage_buffer: float = 0.0,
+                                   fee_type: str = 'taker') -> Dict:
+        """Scan one exchange; returns opportunities and per-scan diagnostics.
+
+        An opportunity must clear exchange fees (3 taker legs) and a slippage
+        buffer by at least `min_net_rate` percent — raw `real_rate` is not enough.
+        """
         empty_stats = {
             'pairs_checked': 0,
             'missing_prices': 0,
@@ -91,6 +98,7 @@ class MultiExchangeManager:
             'last_error': None,
             'best_surface_perc': None,
             'best_real_perc': None,
+            'best_net_perc': None,
         }
         adapter = self.adapters.get(exchange.lower())
         if not adapter:
@@ -139,7 +147,16 @@ class MultiExchangeManager:
                             real_rate = real_rate_arb.get('real_rate_perc', 0)
                             if stats['best_real_perc'] is None or real_rate > stats['best_real_perc']:
                                 stats['best_real_perc'] = real_rate
-                            if real_rate >= min_real_rate:
+
+                            fee = calculate_fee_impact(exchange, real_rate, fee_type)
+                            net_rate = (fee['net_profit_perc'] or 0) - slippage_buffer
+                            real_rate_arb['fee_perc'] = fee['total_fee_3_trades']
+                            real_rate_arb['slippage_buffer_perc'] = slippage_buffer
+                            real_rate_arb['net_rate_perc'] = net_rate
+                            if stats['best_net_perc'] is None or net_rate > stats['best_net_perc']:
+                                stats['best_net_perc'] = net_rate
+
+                            if net_rate >= min_net_rate:
                                 real_rate_arb['exchange'] = exchange
                                 real_rate_arb['surface_arb'] = surface_arb
                                 opportunities.append(real_rate_arb)
