@@ -14,6 +14,9 @@ class BinanceAdapter(ExchangeAdapter):
 
     def __init__(self):
         super().__init__(name="Binance", base_url="https://api.binance.com/api/v3")
+        # Binance exposes no public no-auth spot-fee endpoint; 0.10% is the
+        # standard regular-user rate (verified May 2026, binance.com/en/fee).
+        self.taker_fee = 0.10
 
     def get_all_tickers(self) -> List[Dict]:
         data = self.fetch_with_retry(f"{self.base_url}/ticker/24hr")

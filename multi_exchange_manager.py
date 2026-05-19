@@ -23,9 +23,12 @@ STABLE_USD = {
 
 
 def _build_usd_rates(tickers: List[Dict]) -> Dict[str, float]:
-    """USD value of one unit of each currency, read off <currency>_<stable>
-    tickers. Stablecoins map to 1.0; anything without a stable-quoted ticker
-    is simply absent (callers leave such pairs unfiltered)."""
+    """USD value of one unit of each currency, read off tickers quoted against
+    a stablecoin on either side. Stablecoins map to 1.0; a currency that never
+    trades against a stable is simply absent (callers leave such pairs alone).
+
+    Both sides matter: a fiat like JPY usually only lists as USD_JPY (quote
+    side), so without the inverse it would never get a rate."""
     rates: Dict[str, float] = {s: 1.0 for s in STABLE_USD}
     for t in tickers:
         symbol = t.get('symbol', '')
@@ -36,22 +39,30 @@ def _build_usd_rates(tickers: List[Dict]) -> Dict[str, float]:
             last = float(t.get('last') or 0)
         except (ValueError, TypeError):
             continue
-        if quote in STABLE_USD and base not in rates and last > 0:
-            rates[base] = last
+        if last <= 0:
+            continue
+        if quote in STABLE_USD and base not in rates:
+            rates[base] = last                  # base priced directly in USD
+        elif base in STABLE_USD and quote not in rates:
+            rates[quote] = 1.0 / last           # quote priced via the inverse
     return rates
 
 
 def filter_by_usd_volume(tickers: List[Dict], tradeable: List[str],
-                         min_usd_volume: float):
-    """Drop symbols whose 24h volume, converted to USD, is below the threshold.
+                         min_usd_volume: float,
+                         by_quote: Dict[str, float] = None):
+    """Drop symbols whose 24h volume, converted to USD, is below the floor.
 
     `volume` is base-asset volume on all four adapters, so quote volume is
-    volume * last, then * the quote currency's USD rate. Pairs whose quote
-    cannot be priced in USD are kept (can't assess -> don't drop).
+    volume * last, then * the quote currency's USD rate. `by_quote` overrides
+    the floor per quote currency (fiat quotes need more volume — they spawn
+    stale-quote ghosts); quotes not listed use `min_usd_volume`. Pairs whose
+    quote cannot be priced in USD are kept (can't assess -> don't drop).
 
     Returns (kept_symbols, dropped_count).
     """
-    if min_usd_volume <= 0:
+    by_quote = by_quote or {}
+    if min_usd_volume <= 0 and not by_quote:
         return tradeable, 0
     rates = _build_usd_rates(tickers)
     by_symbol = {t.get('symbol'): t for t in tickers}
@@ -61,15 +72,17 @@ def filter_by_usd_volume(tickers: List[Dict], tradeable: List[str],
         if not ticker or '_' not in symbol:
             kept.append(symbol)
             continue
-        rate = rates.get(symbol.split('_', 1)[1])
+        quote = symbol.split('_', 1)[1]
+        rate = rates.get(quote)
         if rate is None:
             kept.append(symbol)               # quote not priceable in USD
             continue
+        threshold = by_quote.get(quote, min_usd_volume)
         try:
             usd_vol = float(ticker.get('volume') or 0) * float(ticker.get('last') or 0) * rate
         except (ValueError, TypeError):
             usd_vol = 0.0
-        if usd_vol >= min_usd_volume:
+        if usd_vol >= threshold:
             kept.append(symbol)
         else:
             dropped += 1
@@ -123,17 +136,21 @@ class MultiExchangeManager:
             return dict(zip(names, results_list))
 
     def get_tradeable_pairs(self, exchange_tickers: Dict[str, List[Dict]],
-                            min_usd_volume: float = 0.0) -> Dict[str, List[str]]:
+                            min_usd_volume: float = 0.0,
+                            min_usd_volume_by_quote: Dict[str, float] = None
+                            ) -> Dict[str, List[str]]:
         results = {}
         for exchange, tickers in exchange_tickers.items():
             adapter = self.adapters.get(exchange)
             if adapter and tickers:
                 tradeable = adapter.get_tradeable_pairs(tickers)
-                kept, dropped = filter_by_usd_volume(tickers, tradeable, min_usd_volume)
+                kept, dropped = filter_by_usd_volume(
+                    tickers, tradeable, min_usd_volume, min_usd_volume_by_quote
+                )
                 results[exchange] = kept
                 if dropped:
                     print(f"  ✓ {exchange}: {len(kept)} tradeable pairs "
-                          f"({dropped} dropped: 24h volume < ${min_usd_volume:,.0f})")
+                          f"({dropped} dropped: low 24h USD volume)")
                 else:
                     print(f"  ✓ {exchange}: {len(kept)} tradeable pairs")
         return results
@@ -151,11 +168,16 @@ class MultiExchangeManager:
                                    min_surface_rate: float = 0.0,
                                    min_net_rate: float = 0.0,
                                    slippage_buffer: float = 0.0,
-                                   fee_type: str = 'taker') -> Dict:
+                                   fee_type: str = 'taker',
+                                   auto_depth_gate: bool = False,
+                                   depth_gate_margin: float = 0.0) -> Dict:
         """Scan one exchange; returns opportunities and per-scan diagnostics.
 
         An opportunity must clear exchange fees (3 taker legs) and a slippage
         buffer by at least `min_net_rate` percent — raw `real_rate` is not enough.
+
+        With `auto_depth_gate`, orderbook fetches are skipped for pairs whose
+        surface rate cannot possibly clear that hurdle — see `depth_gate` below.
         """
         empty_stats = {
             'pairs_checked': 0,
@@ -163,6 +185,7 @@ class MultiExchangeManager:
             'paths_evaluated': 0,
             'no_path': 0,
             'positive_surface': 0,
+            'depth_gate': None,
             'depth_checked': 0,
             'book_thin': 0,
             'book_thin_fill_sum': 0.0,
@@ -190,6 +213,19 @@ class MultiExchangeManager:
 
             ticker_dict = {t['symbol']: t for t in tickers}
 
+            # Depth-check gate: a pair can only net positive if its real rate
+            # clears 3 legs of fees + the slippage buffer + min_net_rate. real
+            # tracks surface closely, so skip the orderbook fetch for any pair
+            # whose surface is below that hurdle (less a margin, since real can
+            # marginally top surface). Built from the exchange's lowest taker
+            # fee — so the gate is permissive and never skips a real
+            # opportunity; exact per-pair fees are applied at the net stage.
+            depth_gate = min_surface_rate
+            if auto_depth_gate:
+                hurdle = adapter.min_taker_fee() * 3 + slippage_buffer + min_net_rate
+                depth_gate = max(min_surface_rate, hurdle - depth_gate_margin)
+            stats['depth_gate'] = depth_gate
+
             for t_pair in triangular_pairs:
                 try:
                     prices_dict = self._get_prices_for_pair(t_pair, ticker_dict)
@@ -216,7 +252,7 @@ class MultiExchangeManager:
                     if surface_rate > 0:
                         stats['positive_surface'] += 1
 
-                    if surface_rate >= min_surface_rate:
+                    if surface_rate >= depth_gate:
                         stats['depth_checked'] += 1
                         real_rate_arb = await self._get_depth_async(session, adapter, surface_arb)
                         if real_rate_arb.get('book_exhausted'):
@@ -237,7 +273,14 @@ class MultiExchangeManager:
                             if stats['best_real_perc'] is None or real_rate > stats['best_real_perc']:
                                 stats['best_real_perc'] = real_rate
 
-                            fee = calculate_fee_impact(exchange, real_rate, fee_type)
+                            # Exact fee: sum each leg's live taker rate —
+                            # legs can differ (e.g. KuCoin fee categories).
+                            fee_3 = sum(
+                                adapter.get_taker_fee(real_rate_arb[c]) or 0.0
+                                for c in ('contract_1', 'contract_2', 'contract_3')
+                            )
+                            fee = calculate_fee_impact(exchange, real_rate, fee_type,
+                                                       total_fee_perc=fee_3)
                             net_rate = (fee['net_profit_perc'] or 0) - slippage_buffer
                             real_rate_arb['fee_perc'] = fee['total_fee_3_trades']
                             real_rate_arb['slippage_buffer_perc'] = slippage_buffer

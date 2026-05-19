@@ -19,6 +19,9 @@ class KrakenAdapter(ExchangeAdapter):
         # names the API gave us rather than guessing them.
         self._pair_meta: Dict[str, Dict[str, str]] = {}   # kraken name -> {base, quote, altname}
         self._symbol_to_kraken: Dict[str, str] = {}        # BASE_QUOTE -> kraken depth name
+        # Verified fallback; overwritten each ticker fetch with the live
+        # entry-tier rate from AssetPairs (Kraken's schedule is account-wide).
+        self.taker_fee = 0.40
 
     def get_all_tickers(self) -> List[Dict]:
         return self._fetch_all_tickers_sync()
@@ -63,6 +66,7 @@ class KrakenAdapter(ExchangeAdapter):
         self._pair_meta = {}
         self._symbol_to_kraken = {}
         names = []
+        live_taker_fee = None
         for kraken_name, info in pairs_result.items():
             if kraken_name.endswith('.d'):          # dark-pool variant
                 continue
@@ -71,13 +75,27 @@ class KrakenAdapter(ExchangeAdapter):
             base, quote = self._clean_pair(info)
             if not base or not quote:
                 continue
+            if live_taker_fee is None:
+                live_taker_fee = self._entry_tier_fee(info.get('fees'))
             self._pair_meta[kraken_name] = {
                 'base': base,
                 'quote': quote,
                 'altname': info.get('altname') or kraken_name,
             }
             names.append(kraken_name)
+        if live_taker_fee is not None:
+            self.taker_fee = live_taker_fee
         return names
+
+    @staticmethod
+    def _entry_tier_fee(fee_tiers):
+        """Entry-tier (0-volume) taker fee from a Kraken `fees` array
+        [[volume, pct], ...]. The schedule is account-wide, so any online
+        pair's array carries the same tiers."""
+        try:
+            return float(fee_tiers[0][1])
+        except (TypeError, IndexError, ValueError):
+            return None
 
     def _clean_pair(self, info: Dict) -> Tuple[str, str]:
         """Derive human-readable (base, quote) from an AssetPairs entry,

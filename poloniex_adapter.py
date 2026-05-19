@@ -7,6 +7,7 @@ class PoloniexAdapter(ExchangeAdapter):
 
     def __init__(self):
         super().__init__(name="Poloniex", base_url="https://api.poloniex.com")
+        self.taker_fee = 0.155   # verified fallback (Poloniex is disabled by default)
 
     def get_all_tickers(self) -> List[Dict]:
         data = self.fetch_with_retry(f"{self.base_url}/markets/ticker24h")

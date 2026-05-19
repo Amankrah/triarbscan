@@ -2,19 +2,51 @@ from exchange_adapter import ExchangeAdapter
 from typing import Dict, List, Tuple
 import aiohttp
 
+# KuCoin Lv0 spot taker fee by feeCategory — Class A / B / C
+# (verified May 2026; kucoin.com fee schedule).
+KUCOIN_FEE_BY_CATEGORY = {1: 0.10, 2: 0.16, 3: 0.24}
+
 
 class KuCoinAdapter(ExchangeAdapter):
 
     def __init__(self):
         super().__init__(name="KuCoin", base_url="https://api.kucoin.com/api/v1")
+        self.taker_fee = 0.10   # Class A default; per-pair rates loaded live
+
+    def _symbols_url(self) -> str:
+        return self.base_url.replace('/api/v1', '/api/v2') + '/symbols'
 
     def get_all_tickers(self) -> List[Dict]:
         data = self.fetch_with_retry(f"{self.base_url}/market/allTickers")
+        self._load_fee_map(self.fetch_with_retry(self._symbols_url()))
         return self._extract_tickers(data)
 
     async def get_all_tickers_async(self, session: aiohttp.ClientSession) -> List[Dict]:
         data = await self.fetch_with_retry_async(session, f"{self.base_url}/market/allTickers")
+        symbols = await self.fetch_with_retry_async(session, self._symbols_url())
+        self._load_fee_map(symbols)
         return self._extract_tickers(data)
+
+    def _load_fee_map(self, symbols_data: Dict) -> None:
+        """Build per-pair taker fees from /api/v2/symbols. Each symbol carries
+        a feeCategory (1/2/3 -> Class A/B/C) and a taker fee coefficient (a
+        promotional multiplier, normally 1.0). On a failed fetch the previous
+        map is kept rather than wiped."""
+        if not symbols_data or symbols_data.get('code') != '200000':
+            return
+        fees = {}
+        for s in symbols_data.get('data', []):
+            base, quote = s.get('baseCurrency'), s.get('quoteCurrency')
+            if not base or not quote:
+                continue
+            rate = KUCOIN_FEE_BY_CATEGORY.get(s.get('feeCategory'), self.taker_fee)
+            try:
+                coef = float(s.get('takerFeeCoefficient') or 1.0)
+            except (ValueError, TypeError):
+                coef = 1.0
+            fees[f"{base}_{quote}"] = rate * coef
+        if fees:
+            self.taker_fee_by_symbol = fees
 
     def _extract_tickers(self, data: Dict) -> List[Dict]:
         if not data or data.get('code') != '200000':

@@ -14,6 +14,25 @@ class ExchangeAdapter(ABC):
         self.base_url = base_url
         self.max_retries = 3
         self.retry_delay = 1
+        # Taker fee, % per trade. `taker_fee` is the exchange-wide rate (or a
+        # verified fallback); `taker_fee_by_symbol` holds per-pair overrides
+        # for exchanges that price pairs differently (e.g. KuCoin categories).
+        # Subclasses populate these — from live API data where it is exposed.
+        self.taker_fee: Optional[float] = None
+        self.taker_fee_by_symbol: Dict[str, float] = {}
+
+    def get_taker_fee(self, symbol: str) -> Optional[float]:
+        """Taker fee (%) for one pair — per-symbol rate if known, else the
+        exchange-wide rate."""
+        return self.taker_fee_by_symbol.get(symbol, self.taker_fee)
+
+    def min_taker_fee(self) -> float:
+        """Lowest taker fee any pair on this exchange can have. Used to build
+        a permissive pre-filter gate that never skips a real opportunity."""
+        fees = list(self.taker_fee_by_symbol.values())
+        if self.taker_fee is not None:
+            fees.append(self.taker_fee)
+        return min(fees) if fees else 0.0
 
     @abstractmethod
     def get_all_tickers(self) -> List[Dict]:

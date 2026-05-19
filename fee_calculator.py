@@ -6,6 +6,10 @@ if sys.platform == 'win32':
     except AttributeError:
         pass
 
+# Verified static fallback fee schedule (entry tier, % per trade). The scanner
+# prefers live fees from each adapter where the public API exposes them
+# (Kraken AssetPairs, KuCoin symbols feeCategory); this dict is used only when
+# no live rate is available. Verified May 2026 against each exchange.
 EXCHANGE_FEES = {
     'poloniex': {'maker': 0.155, 'taker': 0.155,
                  'vip_levels': {'VIP1': {'maker': 0.145, 'taker': 0.145},
@@ -15,7 +19,9 @@ EXCHANGE_FEES = {
                 'vip_levels': {'VIP1': {'maker': 0.08, 'taker': 0.08},
                                'VIP2': {'maker': 0.06, 'taker': 0.06},
                                'VIP3': {'maker': 0.02, 'taker': 0.02}}},
-    'kraken': {'maker': 0.16, 'taker': 0.26,
+    # Standard = entry tier (0-volume), verified against Kraken's public
+    # AssetPairs `fees`/`fees_maker` arrays: [[0, 0.40], [10000, 0.35], ...].
+    'kraken': {'maker': 0.25, 'taker': 0.40,
                'vip_levels': {'VIP1': {'maker': 0.14, 'taker': 0.24},
                               'VIP2': {'maker': 0.12, 'taker': 0.22},
                               'VIP3': {'maker': 0.10, 'taker': 0.20}}},
@@ -26,24 +32,32 @@ EXCHANGE_FEES = {
 }
 
 
-def calculate_fee_impact(exchange, real_rate_perc, fee_type='taker', vip_level=None):
+def calculate_fee_impact(exchange, real_rate_perc, fee_type='taker', vip_level=None,
+                         total_fee_perc=None):
+    """Net profit after fees.
+
+    `total_fee_perc` is the exact summed cost of all 3 legs — pass it when the
+    caller has live per-pair fees (legs can carry different rates, e.g. KuCoin
+    fee categories). When omitted, fall back to the static EXCHANGE_FEES table
+    (one uniform rate x 3).
+    """
     exchange = exchange.lower()
-    if exchange not in EXCHANGE_FEES:
-        return {'error': f'Unknown exchange: {exchange}', 'net_profit_perc': None, 'is_profitable': False}
+    if total_fee_perc is None:
+        if exchange not in EXCHANGE_FEES:
+            return {'error': f'Unknown exchange: {exchange}', 'net_profit_perc': None, 'is_profitable': False}
+        fee_info = EXCHANGE_FEES[exchange]
+        if vip_level and vip_level in fee_info.get('vip_levels', {}):
+            fee_rate = fee_info['vip_levels'][vip_level][fee_type]
+        else:
+            fee_rate = fee_info[fee_type]
+        total_fee_perc = fee_rate * 3
 
-    fee_info = EXCHANGE_FEES[exchange]
-    if vip_level and vip_level in fee_info.get('vip_levels', {}):
-        fee_rate = fee_info['vip_levels'][vip_level][fee_type]
-    else:
-        fee_rate = fee_info[fee_type]
-
-    total_fee_perc = fee_rate * 3
     net_profit_perc = real_rate_perc - total_fee_perc
     return {
         'exchange': exchange,
         'fee_type': fee_type,
         'vip_level': vip_level or 'Standard',
-        'fee_per_trade': fee_rate,
+        'fee_per_trade': total_fee_perc / 3,
         'total_fee_3_trades': total_fee_perc,
         'real_profit_perc': real_rate_perc,
         'net_profit_perc': net_profit_perc,

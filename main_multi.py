@@ -4,12 +4,30 @@ import time
 
 from multi_exchange_manager import MultiExchangeManager
 
-ENABLED_EXCHANGES = ['poloniex', 'binance', 'kraken', 'kucoin']
-MIN_USD_VOLUME = 50000   # drop pairs below this 24h USD volume (stale-quote ghosts)
-MIN_SURFACE_RATE = 0.0   # only fetch order books when surface profit >= this
+# Poloniex dropped: at the volume floor it has only 1 liquid triangle —
+# not worth the ticker-fetch overhead. Its adapter is kept for later use.
+ENABLED_EXCHANGES = ['binance', 'kraken', 'kucoin']
+MIN_USD_VOLUME = 50000   # default 24h USD volume floor (drops stale-quote ghosts)
+# Fiat-quoted pairs spawn stale-quote ghosts (thin USDT_GBP, USDT_JPY, ...) that
+# a $50K floor misses. Require more volume per fiat quote currency; quotes not
+# listed fall back to MIN_USD_VOLUME. TRY/BRL are left at the default on
+# purpose — those venues' altcoin cycles are healthy microstructure worth
+# watching, not ghosts.
+MIN_USD_VOLUME_BY_QUOTE = {
+    'EUR': 250000, 'GBP': 250000, 'JPY': 250000,
+    'CAD': 250000, 'AUD': 250000, 'CHF': 250000,
+}
+MIN_SURFACE_RATE = 0.0   # manual floor on surface rate before an orderbook fetch
 SLIPPAGE_BUFFER = 0.10   # % subtracted on top of fees — L20 book walks overstate fills
 MIN_NET_RATE = 0.0       # opportunity must clear fees + slippage by at least this %
 FEE_TYPE = 'taker'       # triangular legs cross the spread, so taker fees apply
+# Skip orderbook fetches for pairs whose surface rate can't clear the fee +
+# slippage hurdle (computed per exchange). Set False to depth-check every
+# positive-surface pair — slower, but `best real`/`best net` then measure the
+# whole population. The margin sits the gate below the hurdle, since `real`
+# can marginally exceed `surface`.
+AUTO_DEPTH_GATE = True
+DEPTH_GATE_MARGIN = 0.10
 NOTIONAL_USD = 5000      # assumed capital, for the net-profit dollar estimate
 SHOW_SCAN_SUMMARY = True
 SHOW_SCAN_DIAGNOSTICS = True  # best surface/real/net % per exchange each scan
@@ -26,7 +44,8 @@ def step_0_multi():
     exchange_tickers = manager.get_all_tickers_sync()
 
     print("\n🔍 Filtering tradeable pairs...")
-    tradeable_pairs = manager.get_tradeable_pairs(exchange_tickers, MIN_USD_VOLUME)
+    tradeable_pairs = manager.get_tradeable_pairs(
+        exchange_tickers, MIN_USD_VOLUME, MIN_USD_VOLUME_BY_QUOTE)
     total_pairs = sum(len(pairs) for pairs in tradeable_pairs.values())
     print(f"\n✓ Total tradeable pairs: {total_pairs}")
     return manager, tradeable_pairs, exchange_tickers
@@ -56,7 +75,8 @@ async def step_2_multi_async(manager, triangular_pairs):
 
     tasks = [
         manager.scan_exchange_async(exchange, t_pairs, MIN_SURFACE_RATE,
-                                    MIN_NET_RATE, SLIPPAGE_BUFFER, FEE_TYPE)
+                                    MIN_NET_RATE, SLIPPAGE_BUFFER, FEE_TYPE,
+                                    AUTO_DEPTH_GATE, DEPTH_GATE_MARGIN)
         for exchange, t_pairs in triangular_pairs.items()
     ]
     exchange_names = list(triangular_pairs.keys())
@@ -80,10 +100,12 @@ async def step_2_multi_async(manager, triangular_pairs):
             best_s_str = f"{best_s:.4f}%" if best_s is not None else "n/a"
             best_r_str = f"{best_r:.4f}%" if best_r is not None else "n/a"
             best_n_str = f"{best_n:.4f}%" if best_n is not None else "n/a"
+            gate = s.get('depth_gate')
+            gate_str = f"≥{gate:.2f}%" if gate is not None else "off"
             print(
                 f"      diag: evaluated={s['paths_evaluated']} | "
                 f"+surface={s['positive_surface']} | "
-                f"depth_checks={s['depth_checked']} | "
+                f"depth_checks={s['depth_checked']} (gate {gate_str}) | "
                 f"thin={s.get('book_thin', 0)} empty={s.get('book_empty', 0)} | "
                 f"best surface={best_s_str} | best real={best_r_str} | best net={best_n_str}"
             )
