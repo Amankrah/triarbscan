@@ -21,7 +21,10 @@ ORDERBOOK_DEPTH = 100
 # Surface-rate precursor tracking — spot cycles trending toward the gate.
 PRECURSOR_WINDOW = 10            # scans of surface history kept per cycle
 PRECURSOR_GATE_FRACTION = 0.5    # flag a cycle when its MA reaches this x the gate
-MAX_TICK_RATIO = 5e-5            # exclude a leg if one price tick >= this x mid price
+MAX_TICK_RATIO = 2e-4            # exclude a leg if one price tick >= this x mid price
+                                 # (0.020%: usable route counts on all 3 venues,
+                                 # staircase step stays well below the precursor
+                                 # trigger, and clears the ~0.074% XDG ghost)
 AGGREGATE_TREND_WINDOW = 20      # scans of aggregate-mean history for the trend
 
 

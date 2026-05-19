@@ -7,3 +7,7 @@ __pycache__/
 *.json
 !requirements.txt
 .claude/
+manuscript/
+
+# scanner-generated logs (triangular_pairs_*.json already covered by *.json)
+surface_aggregate_log*.csv

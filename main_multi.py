@@ -36,23 +36,30 @@ DEPTH_GATE_MARGIN = 0.10
 NOTIONAL_USD = 5000      # assumed capital, for the net-profit dollar estimate
 SHOW_SCAN_SUMMARY = True
 SHOW_SCAN_DIAGNOSTICS = True  # best surface/real/net % per exchange each scan
-LOG_AGGREGATE_CSV = True      # append per-scan aggregate surface stats to a CSV
-AGGREGATE_CSV_PATH = 'surface_aggregate_log.csv'
+LOG_AGGREGATE_CSV = True              # append per-scan aggregate surface stats
+AGGREGATE_CSV_PREFIX = 'surface_aggregate_log'   # daily date suffix appended
 
 
 def log_aggregate_csv(stats_by_exchange):
     """Append one row per exchange per scan — timestamp, exchange, mean MA,
-    dispersion, route count — for offline buildup-vs-jump analysis."""
-    ts = datetime.now().isoformat(timespec='seconds')
+    dispersion, route count — for offline buildup-vs-jump analysis.
+
+    Rotates daily: each calendar day writes to its own
+    surface_aggregate_log_YYYY-MM-DD.csv, so a long run never produces one
+    unbounded file and a run spanning midnight rolls over cleanly.
+    """
+    now = datetime.now()
     rows = [
-        [ts, exchange, f"{a['mean_ma']:.8f}", f"{a['dispersion']:.8f}", a['route_count']]
+        [now.isoformat(timespec='seconds'), exchange,
+         f"{a['mean_ma']:.8f}", f"{a['dispersion']:.8f}", a['route_count']]
         for exchange, s in stats_by_exchange.items()
         if (a := s.get('aggregate'))
     ]
     if not rows:
         return
-    new_file = not os.path.exists(AGGREGATE_CSV_PATH)
-    with open(AGGREGATE_CSV_PATH, 'a', newline='') as fp:
+    path = f"{AGGREGATE_CSV_PREFIX}_{now:%Y-%m-%d}.csv"
+    new_file = not os.path.exists(path)
+    with open(path, 'a', newline='') as fp:
         writer = csv.writer(fp)
         if new_file:
             writer.writerow(['timestamp', 'exchange', 'mean_ma', 'dispersion', 'route_count'])
