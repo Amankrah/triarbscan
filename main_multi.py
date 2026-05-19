@@ -5,9 +5,10 @@ import time
 from multi_exchange_manager import MultiExchangeManager
 
 ENABLED_EXCHANGES = ['poloniex', 'binance', 'kraken', 'kucoin']
-MIN_SURFACE_RATE = 0.0
-MIN_REAL_RATE = 0.1
+MIN_SURFACE_RATE = 0.0   # only fetch order books when surface profit >= this
+MIN_REAL_RATE = 0.1      # display threshold; try 0.01 to see near-misses
 SHOW_SCAN_SUMMARY = True
+SHOW_SCAN_DIAGNOSTICS = True  # best surface/real % per exchange each scan
 
 
 def step_0_multi():
@@ -56,11 +57,36 @@ async def step_2_multi_async(manager, triangular_pairs):
     exchange_names = list(triangular_pairs.keys())
     results = await asyncio.gather(*tasks)
 
-    opportunities_by_exchange = dict(zip(exchange_names, results))
-    total_above_threshold = sum(len(opps) for opps in results)
+    opportunities_by_exchange = {}
+    stats_by_exchange = {}
+    for exchange, result in zip(exchange_names, results):
+        opportunities_by_exchange[exchange] = result['opportunities']
+        stats_by_exchange[exchange] = result['stats']
+
+    total_above_threshold = sum(len(opps) for opps in opportunities_by_exchange.values())
 
     for exchange, opportunities in opportunities_by_exchange.items():
         print(f"  ✓ {exchange}: {len(opportunities)} opportunities ≥ {MIN_REAL_RATE}%")
+        if SHOW_SCAN_DIAGNOSTICS:
+            s = stats_by_exchange[exchange]
+            best_s = s['best_surface_perc']
+            best_r = s['best_real_perc']
+            best_s_str = f"{best_s:.4f}%" if best_s is not None else "n/a"
+            best_r_str = f"{best_r:.4f}%" if best_r is not None else "n/a"
+            print(
+                f"      diag: evaluated={s['paths_evaluated']} | "
+                f"+surface={s['positive_surface']} | "
+                f"depth_checks={s['depth_checked']} | "
+                f"best surface={best_s_str} | best real={best_r_str}"
+            )
+            if s['missing_prices']:
+                print(f"      ⚠ {s['missing_prices']} pairs skipped (missing bid/ask)")
+            if s.get('errors'):
+                print(f"      ❌ {s['errors']} pairs raised errors — last: {s.get('last_error')}")
+            if s['no_path'] and s['paths_evaluated'] == 0:
+                print(f"      ⚠ {s['no_path']} pairs: triangle path logic did not match")
+            elif s['no_path']:
+                print(f"      ⚠ {s['no_path']} pairs: no routable path (of {s['paths_evaluated']} evaluated)")
 
     if total_above_threshold:
         opp_num = 1
@@ -97,6 +123,7 @@ async def main_multi_async():
     print("=" * 60)
     print(f"Exchanges: {', '.join(e.capitalize() for e in ENABLED_EXCHANGES)}")
     print(f"Min surface: {MIN_SURFACE_RATE}% | Min real: {MIN_REAL_RATE}%")
+    print("(Fast scans with 0 opps usually means no positive surface — order books not fetched.)")
     print("=" * 60)
 
     manager, tradeable_pairs, _ = step_0_multi()

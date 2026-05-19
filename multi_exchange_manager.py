@@ -78,34 +78,77 @@ class MultiExchangeManager:
 
     async def scan_exchange_async(self, exchange: str, triangular_pairs: List[Dict],
                                    min_surface_rate: float = 0.0,
-                                   min_real_rate: float = 0.1) -> List[Dict]:
+                                   min_real_rate: float = 0.1) -> Dict:
+        """Scan one exchange; returns opportunities and per-scan diagnostics."""
+        empty_stats = {
+            'pairs_checked': 0,
+            'missing_prices': 0,
+            'paths_evaluated': 0,
+            'no_path': 0,
+            'positive_surface': 0,
+            'depth_checked': 0,
+            'errors': 0,
+            'last_error': None,
+            'best_surface_perc': None,
+            'best_real_perc': None,
+        }
         adapter = self.adapters.get(exchange.lower())
         if not adapter:
-            return []
+            return {'opportunities': [], 'stats': empty_stats}
 
         opportunities = []
+        stats = dict(empty_stats)
+        stats['pairs_checked'] = len(triangular_pairs)
+
         async with aiohttp.ClientSession() as session:
             tickers = await adapter.get_all_tickers_async(session)
             if not tickers:
-                return []
+                return {'opportunities': [], 'stats': stats}
 
             ticker_dict = {t['symbol']: t for t in tickers}
 
             for t_pair in triangular_pairs:
                 try:
                     prices_dict = self._get_prices_for_pair(t_pair, ticker_dict)
-                    surface_arb = func_arbitrage.calc_triangular_arb_surface_rate(t_pair, prices_dict)
+                    if not all(prices_dict.values()):
+                        stats['missing_prices'] += 1
+                        continue
 
-                    if surface_arb and surface_arb.get('profit_loss_perc', 0) >= min_surface_rate:
+                    surface_arb, best_rate = func_arbitrage.calc_triangular_arb_surface_rate(
+                        t_pair, prices_dict
+                    )
+                    if best_rate is not None:
+                        stats['paths_evaluated'] += 1
+                        if (stats['best_surface_perc'] is None
+                                or best_rate > stats['best_surface_perc']):
+                            stats['best_surface_perc'] = best_rate
+                    else:
+                        stats['no_path'] += 1
+
+                    if not surface_arb:
+                        continue
+
+                    surface_rate = surface_arb.get('profit_loss_perc', 0)
+                    if surface_rate > 0:
+                        stats['positive_surface'] += 1
+
+                    if surface_rate >= min_surface_rate:
+                        stats['depth_checked'] += 1
                         real_rate_arb = await self._get_depth_async(session, adapter, surface_arb)
-                        if real_rate_arb and real_rate_arb.get('real_rate_perc', 0) >= min_real_rate:
-                            real_rate_arb['exchange'] = exchange
-                            real_rate_arb['surface_arb'] = surface_arb
-                            opportunities.append(real_rate_arb)
-                except Exception:
+                        if real_rate_arb:
+                            real_rate = real_rate_arb.get('real_rate_perc', 0)
+                            if stats['best_real_perc'] is None or real_rate > stats['best_real_perc']:
+                                stats['best_real_perc'] = real_rate
+                            if real_rate >= min_real_rate:
+                                real_rate_arb['exchange'] = exchange
+                                real_rate_arb['surface_arb'] = surface_arb
+                                opportunities.append(real_rate_arb)
+                except Exception as e:
+                    stats['errors'] += 1
+                    stats['last_error'] = f"{type(e).__name__}: {e}"
                     continue
 
-        return opportunities
+        return {'opportunities': opportunities, 'stats': stats}
 
     def _get_prices_for_pair(self, t_pair: Dict, ticker_dict: Dict) -> Dict:
         pair_a_data = ticker_dict.get(t_pair["pair_a"], {})

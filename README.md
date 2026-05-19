@@ -36,7 +36,8 @@ python main_multi.py
 Edit the config block at the top of each entry script:
 
 - `MIN_SURFACE_RATE` — minimum surface profit % before fetching order books
-- `MIN_REAL_RATE` — minimum depth-adjusted profit % to print (use ~0.35% to cover typical taker fees on three legs)
+- `MIN_REAL_RATE` — minimum depth-adjusted profit % to print (use ~0.35% to cover typical taker fees on three legs; use `0.01` to explore near-misses)
+- `SHOW_SCAN_DIAGNOSTICS` — per-exchange best surface/real % each scan (in `main_multi.py`)
 - `ENABLED_EXCHANGES` — list of exchanges for `main_multi.py` (`poloniex`, `binance`, `kraken`, `kucoin`)
 
 Triangular pair caches are written as `structured_triangular_pairs.json` or `triangular_pairs_<exchange>.json` on first run (gitignored).

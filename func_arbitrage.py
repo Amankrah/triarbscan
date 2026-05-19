@@ -112,12 +112,19 @@ def get_price_for_t_pair(t_pair, prices_json):
 
 
 def calc_triangular_arb_surface_rate(t_pair, prices_dict):
+    """Return (profitable_opportunity, best_surface_perc).
+
+    profitable_opportunity is non-empty only when the best path has profit > 0.
+    best_surface_perc is the best rate found across forward/reverse (may be negative).
+    """
     starting_amount = 1
-    min_surface_rate = 0
+    min_profitable_rate = 0
     surface_dict = {}
+    best_surface_perc = None
 
     a_base, a_quote = t_pair["a_base"], t_pair["a_quote"]
     b_base, b_quote = t_pair["b_base"], t_pair["b_quote"]
+    c_base, c_quote = t_pair["c_base"], t_pair["c_quote"]
     pair_a, pair_b, pair_c = t_pair["pair_a"], t_pair["pair_b"], t_pair["pair_c"]
 
     a_ask, a_bid = prices_dict["pair_a_ask"], prices_dict["pair_a_bid"]
@@ -125,7 +132,7 @@ def calc_triangular_arb_surface_rate(t_pair, prices_dict):
     c_ask, c_bid = prices_dict["pair_c_ask"], prices_dict["pair_c_bid"]
 
     if not all([a_ask, a_bid, b_ask, b_bid, c_ask, c_bid]):
-        return {}
+        return {}, None
 
     for direction in ("forward", "reverse"):
         calculated = False
@@ -243,7 +250,10 @@ def calc_triangular_arb_surface_rate(t_pair, prices_dict):
         profit_loss = acquired_coin_t3 - starting_amount
         profit_loss_perc = (profit_loss / starting_amount) * 100 if starting_amount else 0
 
-        if profit_loss_perc > min_surface_rate:
+        if best_surface_perc is None or profit_loss_perc > best_surface_perc:
+            best_surface_perc = profit_loss_perc
+
+        if profit_loss_perc > min_profitable_rate:
             surface_dict = {
                 "swap_1": swap_1, "swap_2": swap_2, "swap_3": swap_3,
                 "contract_1": contract_1, "contract_2": contract_2, "contract_3": contract_3,
@@ -258,9 +268,9 @@ def calc_triangular_arb_surface_rate(t_pair, prices_dict):
                 "profit_loss": profit_loss, "profit_loss_perc": profit_loss_perc,
                 "direction": direction,
             }
-            min_surface_rate = profit_loss_perc
+            min_profitable_rate = profit_loss_perc
 
-    return surface_dict
+    return surface_dict, best_surface_perc
 
 
 def reformated_orderbook(prices, c_direction):

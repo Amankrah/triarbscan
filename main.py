@@ -56,7 +56,7 @@ async def step_2_async():
         pairs_checked += 1
         try:
             prices_dict = func_arbitrage.get_price_for_t_pair(t_pair, prices_json)
-            surface_arb = func_arbitrage.calc_triangular_arb_surface_rate(t_pair, prices_dict)
+            surface_arb, _ = func_arbitrage.calc_triangular_arb_surface_rate(t_pair, prices_dict)
 
             if surface_arb and surface_arb.get('profit_loss_perc', 0) >= MIN_SURFACE_RATE:
                 real_rate_arb = await func_arbitrage.get_depth_from_orderbook_async(surface_arb)
