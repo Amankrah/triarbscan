@@ -3,7 +3,7 @@ import time
 import aiohttp
 import requests
 
-POLONIEX_ORDERBOOK = "https://api.poloniex.com/markets/{symbol}/orderBook?limit=20"
+POLONIEX_ORDERBOOK = "https://api.poloniex.com/markets/{symbol}/orderBook?limit=100"
 STARTING_AMOUNTS = {"USDT": 100, "USDC": 100, "BTC": 0.05, "ETH": 0.1}
 
 
@@ -294,9 +294,19 @@ def reformated_orderbook(prices, c_direction):
 
 
 def calculate_acquired_coin(amount_in, orderbook):
+    """Walk `orderbook` spending `amount_in`.
+
+    Returns (acquired_coin, filled_fraction). filled_fraction is the share of
+    `amount_in` the book could absorb: 1.0 when the whole size filled, < 1.0
+    when the walk ran off the last level (book too thin / size too large). The
+    partial `acquired_coin` is still returned so callers can report how far
+    short the book fell rather than just seeing a catastrophic zero.
+    """
+    if not amount_in:
+        return 0.0, 0.0
     trading_balance = amount_in
-    acquired_coin = 0
-    for idx, level in enumerate(orderbook):
+    acquired_coin = 0.0
+    for level in orderbook:
         level_price, level_qty = level[0], level[1]
         if trading_balance <= level_qty:
             quantity_bought = trading_balance
@@ -306,30 +316,96 @@ def calculate_acquired_coin(amount_in, orderbook):
             trading_balance -= quantity_bought
         acquired_coin += quantity_bought * level_price
         if trading_balance == 0:
-            return acquired_coin
-        if idx == len(orderbook) - 1:
-            return 0
-    return acquired_coin
+            return acquired_coin, 1.0
+    return acquired_coin, (amount_in - trading_balance) / amount_in
+
+
+def _leg_consumes(contract, direction):
+    """Currency a depth leg spends. base_to_quote walks asks (spends quote);
+    quote_to_base walks bids (spends base)."""
+    base, quote = contract.split("_")
+    return quote if direction == "base_to_quote" else base
+
+
+def _leg_produces(contract, direction):
+    """Currency a depth leg yields — the opposite of what it consumes."""
+    base, quote = contract.split("_")
+    return base if direction == "base_to_quote" else quote
+
+
+def order_legs_for_execution(raw_legs):
+    """Reorder triangle legs into a runnable sequence.
+
+    `raw_legs` is three (contract, direction) pairs. calc_triangular_arb_surface_rate
+    records correct contracts/directions/rates, but in an order that is not a valid
+    chain — leg N's output currency need not be leg N+1's input. The depth walk
+    feeds each leg's output into the next, so it needs a real execution order.
+
+    Follows the produce -> consume links to rebuild the cycle, then enters it on
+    a currency we hold a test size for (STARTING_AMOUNTS), falling back to any.
+
+    Returns (ordered_legs, start_currency), or (None, None) if the three legs do
+    not form a closed cycle.
+    """
+    by_consumes = {_leg_consumes(c, d): (c, d) for c, d in raw_legs}
+    if len(by_consumes) != 3:
+        return None, None  # a currency consumed twice — not a clean triangle
+
+    cycle_currencies = set(by_consumes)
+    start = next(
+        (cur for cur in STARTING_AMOUNTS if cur in cycle_currencies),
+        next(iter(cycle_currencies)),
+    )
+
+    ordered = []
+    currency = start
+    for _ in range(3):
+        leg = by_consumes.get(currency)
+        if leg is None:
+            return None, None  # chain does not close
+        ordered.append(leg)
+        currency = _leg_produces(*leg)
+    if currency != start:
+        return None, None  # legs do not return to the start currency
+    return ordered, start
 
 
 async def get_depth_from_orderbook_async(surface_arb):
-    swap_1 = surface_arb["swap_1"]
+    raw_legs = [
+        (surface_arb["contract_1"], surface_arb["direction_trade_1"]),
+        (surface_arb["contract_2"], surface_arb["direction_trade_2"]),
+        (surface_arb["contract_3"], surface_arb["direction_trade_3"]),
+    ]
+    legs, swap_1 = order_legs_for_execution(raw_legs)
+    if legs is None:
+        return {}
     starting_amount = STARTING_AMOUNTS.get(swap_1, 100)
-    contracts = surface_arb["contract_1"], surface_arb["contract_2"], surface_arb["contract_3"]
-    directions = (
-        surface_arb["direction_trade_1"],
-        surface_arb["direction_trade_2"],
-        surface_arb["direction_trade_3"],
-    )
+    contracts = [c for c, _ in legs]
+    directions = [d for _, d in legs]
     urls = [POLONIEX_ORDERBOOK.format(symbol=c) for c in contracts]
 
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(*[get_coin_tickers_async(session, u) for u in urls])
 
     depths = [reformated_orderbook(r, d) for r, d in zip(results, directions)]
-    acquired_coin_t1 = calculate_acquired_coin(starting_amount, depths[0])
-    acquired_coin_t2 = calculate_acquired_coin(acquired_coin_t1, depths[1])
-    acquired_coin_t3 = calculate_acquired_coin(acquired_coin_t2, depths[2])
+
+    amount = starting_amount
+    for leg, depth in enumerate(depths, start=1):
+        amount, filled_fraction = calculate_acquired_coin(amount, depth)
+        if filled_fraction <= 0.0:
+            print(
+                f"⚠ empty orderbook on leg {leg} ({contracts[leg - 1]}) — "
+                f"fetch failed or pair not recognised"
+            )
+            return {}
+        if filled_fraction < 1.0:
+            print(
+                f"⚠ book too thin on leg {leg} ({contracts[leg - 1]}) — "
+                f"filled {filled_fraction * 100:.0f}% of size; "
+                f"{starting_amount} {swap_1} too large for available depth"
+            )
+            return {}
+    acquired_coin_t3 = amount
 
     profit_loss = acquired_coin_t3 - starting_amount
     real_rate_perc = (profit_loss / starting_amount) * 100 if starting_amount else 0

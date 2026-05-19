@@ -11,6 +11,11 @@ import func_arbitrage
 
 STARTING_AMOUNTS = {"USDT": 100, "USDC": 100, "BTC": 0.05, "ETH": 0.1}
 
+# Orderbook levels to fetch per leg. 20 is too thin for BTC-denominated
+# notional on altcoin books — the walk runs off the end and the leg gets
+# silently scored as catastrophic. All four exchanges accept 100.
+ORDERBOOK_DEPTH = 100
+
 
 class MultiExchangeManager:
 
@@ -94,6 +99,10 @@ class MultiExchangeManager:
             'no_path': 0,
             'positive_surface': 0,
             'depth_checked': 0,
+            'book_thin': 0,
+            'book_thin_fill_sum': 0.0,
+            'book_thin_worst_fill': None,
+            'book_empty': 0,
             'errors': 0,
             'last_error': None,
             'best_surface_perc': None,
@@ -143,6 +152,19 @@ class MultiExchangeManager:
                     if surface_rate >= min_surface_rate:
                         stats['depth_checked'] += 1
                         real_rate_arb = await self._get_depth_async(session, adapter, surface_arb)
+                        if real_rate_arb.get('book_exhausted'):
+                            frac = real_rate_arb.get('filled_fraction', 0.0)
+                            if frac <= 0.0:
+                                # No level consumed at all -> empty book,
+                                # i.e. a failed / unrecognised orderbook fetch.
+                                stats['book_empty'] += 1
+                            else:
+                                stats['book_thin'] += 1
+                                stats['book_thin_fill_sum'] += frac
+                                if (stats['book_thin_worst_fill'] is None
+                                        or frac < stats['book_thin_worst_fill']):
+                                    stats['book_thin_worst_fill'] = frac
+                            continue
                         if real_rate_arb:
                             real_rate = real_rate_arb.get('real_rate_perc', 0)
                             if stats['best_real_perc'] is None or real_rate > stats['best_real_perc']:
@@ -184,29 +206,46 @@ class MultiExchangeManager:
                                adapter: ExchangeAdapter,
                                surface_arb: Dict) -> Dict:
         try:
-            contract_1 = surface_arb["contract_1"]
-            contract_2 = surface_arb["contract_2"]
-            contract_3 = surface_arb["contract_3"]
-            directions = (
-                surface_arb["direction_trade_1"],
-                surface_arb["direction_trade_2"],
-                surface_arb["direction_trade_3"],
-            )
+            raw_legs = [
+                (surface_arb["contract_1"], surface_arb["direction_trade_1"]),
+                (surface_arb["contract_2"], surface_arb["direction_trade_2"]),
+                (surface_arb["contract_3"], surface_arb["direction_trade_3"]),
+            ]
+            # The surface calc records correct legs but not in execution order
+            # (and a mislabeled swap_1). Reorder into a runnable chain and
+            # recover the true start currency before walking depth.
+            legs, swap_1 = func_arbitrage.order_legs_for_execution(raw_legs)
+            if legs is None:
+                return {}
+            contracts = [c for c, _ in legs]
+            directions = [d for _, d in legs]
 
             orderbooks = await asyncio.gather(
-                adapter.get_orderbook_async(session, contract_1, 20),
-                adapter.get_orderbook_async(session, contract_2, 20),
-                adapter.get_orderbook_async(session, contract_3, 20),
+                adapter.get_orderbook_async(session, contracts[0], ORDERBOOK_DEPTH),
+                adapter.get_orderbook_async(session, contracts[1], ORDERBOOK_DEPTH),
+                adapter.get_orderbook_async(session, contracts[2], ORDERBOOK_DEPTH),
             )
 
-            depth_1 = func_arbitrage.reformated_orderbook(orderbooks[0], directions[0])
-            depth_2 = func_arbitrage.reformated_orderbook(orderbooks[1], directions[1])
-            depth_3 = func_arbitrage.reformated_orderbook(orderbooks[2], directions[2])
+            depths = (
+                func_arbitrage.reformated_orderbook(orderbooks[0], directions[0]),
+                func_arbitrage.reformated_orderbook(orderbooks[1], directions[1]),
+                func_arbitrage.reformated_orderbook(orderbooks[2], directions[2]),
+            )
 
-            starting_amount = STARTING_AMOUNTS.get(surface_arb["swap_1"], 100)
-            acquired_coin_t1 = func_arbitrage.calculate_acquired_coin(starting_amount, depth_1)
-            acquired_coin_t2 = func_arbitrage.calculate_acquired_coin(acquired_coin_t1, depth_2)
-            acquired_coin_t3 = func_arbitrage.calculate_acquired_coin(acquired_coin_t2, depth_3)
+            starting_amount = STARTING_AMOUNTS.get(swap_1, 100)
+            amount = starting_amount
+            for leg, depth in enumerate(depths, start=1):
+                amount, filled_fraction = func_arbitrage.calculate_acquired_coin(amount, depth)
+                # filled_fraction < 1.0 means the book was too thin to fill the
+                # size. Report it distinctly — with how far short the walk fell —
+                # so it isn't lumped in with genuine "no opportunity" results.
+                if filled_fraction < 1.0:
+                    return {
+                        'book_exhausted': True,
+                        'filled_fraction': filled_fraction,
+                        'exhausted_leg': leg,
+                    }
+            acquired_coin_t3 = amount
 
             profit_loss = acquired_coin_t3 - starting_amount
             real_rate_perc = (profit_loss / starting_amount) * 100 if starting_amount else 0
@@ -215,9 +254,9 @@ class MultiExchangeManager:
                 return {
                     "profit_loss": profit_loss,
                     "real_rate_perc": real_rate_perc,
-                    "contract_1": contract_1,
-                    "contract_2": contract_2,
-                    "contract_3": contract_3,
+                    "contract_1": contracts[0],
+                    "contract_2": contracts[1],
+                    "contract_3": contracts[2],
                     "contract_1_direction": directions[0],
                     "contract_2_direction": directions[1],
                     "contract_3_direction": directions[2],

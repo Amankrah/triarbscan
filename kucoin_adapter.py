@@ -37,10 +37,18 @@ class KuCoinAdapter(ExchangeAdapter):
                 continue
         return normalized
 
+    @staticmethod
+    def _depth_endpoint(limit: int) -> str:
+        """KuCoin only exposes fixed-depth public books: level2_20 and
+        level2_100 (deeper books need an authenticated request). Pick the
+        100-level endpoint whenever more than 20 levels are asked for."""
+        return 'level2_100' if limit > 20 else 'level2_20'
+
     def get_orderbook(self, symbol: str, limit: int = 20) -> Dict:
         kucoin_symbol = symbol.replace('_', '-')
+        endpoint = self._depth_endpoint(limit)
         data = self.fetch_with_retry(
-            f"{self.base_url}/market/orderbook/level2_20?symbol={kucoin_symbol}"
+            f"{self.base_url}/market/orderbook/{endpoint}?symbol={kucoin_symbol}"
         )
         if not data or data.get('code') != '200000':
             return {'bids': [], 'asks': []}
@@ -49,8 +57,9 @@ class KuCoinAdapter(ExchangeAdapter):
     async def get_orderbook_async(self, session: aiohttp.ClientSession,
                                    symbol: str, limit: int = 20) -> Dict:
         kucoin_symbol = symbol.replace('_', '-')
+        endpoint = self._depth_endpoint(limit)
         data = await self.fetch_with_retry_async(
-            session, f"{self.base_url}/market/orderbook/level2_20?symbol={kucoin_symbol}"
+            session, f"{self.base_url}/market/orderbook/{endpoint}?symbol={kucoin_symbol}"
         )
         if not data or data.get('code') != '200000':
             return {'bids': [], 'asks': []}

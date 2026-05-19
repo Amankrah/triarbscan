@@ -83,8 +83,23 @@ async def step_2_multi_async(manager, triangular_pairs):
                 f"      diag: evaluated={s['paths_evaluated']} | "
                 f"+surface={s['positive_surface']} | "
                 f"depth_checks={s['depth_checked']} | "
+                f"thin={s.get('book_thin', 0)} empty={s.get('book_empty', 0)} | "
                 f"best surface={best_s_str} | best real={best_r_str} | best net={best_n_str}"
             )
+            if s.get('book_thin'):
+                n = s['book_thin']
+                avg_fill = (s.get('book_thin_fill_sum', 0.0) / n) * 100
+                worst_fill = (s.get('book_thin_worst_fill') or 0) * 100
+                print(
+                    f"      ⚠ {n} pairs: orderbook too thin for the test size — "
+                    f"filled {avg_fill:.0f}% of size on avg, worst {worst_fill:.0f}% "
+                    f"(~95%+ → bump levels; <~90% → size genuinely too large)"
+                )
+            if s.get('book_empty'):
+                print(
+                    f"      ⚠ {s['book_empty']} pairs: empty orderbook returned "
+                    f"(fetch failed or pair not recognised by the exchange)"
+                )
             if s['missing_prices']:
                 print(f"      ⚠ {s['missing_prices']} pairs skipped (missing bid/ask)")
             if s.get('errors'):
