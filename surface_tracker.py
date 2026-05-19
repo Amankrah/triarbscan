@@ -28,6 +28,23 @@ class SurfaceTracker:
         dq = self._history.get(route)
         return sum(dq) / len(dq) if dq else None
 
+    def aggregate(self, min_samples: int = 1) -> Optional[Dict[str, float]]:
+        """Mean and dispersion of the moving-average surface across every
+        tracked route.
+
+        A rising mean with stable dispersion points to a venue-wide move; a
+        flat mean with wide dispersion points to independent, idiosyncratic
+        route spikes. Returns {mean_ma, dispersion, route_count} or None.
+        """
+        mas = [sum(dq) / len(dq) for dq in self._history.values()
+               if len(dq) >= min_samples]
+        if not mas:
+            return None
+        n = len(mas)
+        mean = sum(mas) / n
+        variance = sum((x - mean) ** 2 for x in mas) / n
+        return {'mean_ma': mean, 'dispersion': variance ** 0.5, 'route_count': n}
+
     def precursors(self, threshold: float,
                    min_samples: int = 4) -> List[Tuple[str, float, bool]]:
         """Cycles whose moving-average surface rate has reached `threshold`.

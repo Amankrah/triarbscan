@@ -1,6 +1,9 @@
 import asyncio
+import csv
 import json
+import os
 import time
+from datetime import datetime
 
 from multi_exchange_manager import (
     MultiExchangeManager, PRECURSOR_WINDOW, PRECURSOR_GATE_FRACTION,
@@ -33,6 +36,27 @@ DEPTH_GATE_MARGIN = 0.10
 NOTIONAL_USD = 5000      # assumed capital, for the net-profit dollar estimate
 SHOW_SCAN_SUMMARY = True
 SHOW_SCAN_DIAGNOSTICS = True  # best surface/real/net % per exchange each scan
+LOG_AGGREGATE_CSV = True      # append per-scan aggregate surface stats to a CSV
+AGGREGATE_CSV_PATH = 'surface_aggregate_log.csv'
+
+
+def log_aggregate_csv(stats_by_exchange):
+    """Append one row per exchange per scan — timestamp, exchange, mean MA,
+    dispersion, route count — for offline buildup-vs-jump analysis."""
+    ts = datetime.now().isoformat(timespec='seconds')
+    rows = [
+        [ts, exchange, f"{a['mean_ma']:.8f}", f"{a['dispersion']:.8f}", a['route_count']]
+        for exchange, s in stats_by_exchange.items()
+        if (a := s.get('aggregate'))
+    ]
+    if not rows:
+        return
+    new_file = not os.path.exists(AGGREGATE_CSV_PATH)
+    with open(AGGREGATE_CSV_PATH, 'a', newline='') as fp:
+        writer = csv.writer(fp)
+        if new_file:
+            writer.writerow(['timestamp', 'exchange', 'mean_ma', 'dispersion', 'route_count'])
+        writer.writerows(rows)
 
 
 def step_0_multi():
@@ -123,6 +147,11 @@ async def step_2_multi_async(manager, triangular_pairs):
                 for route, ma, rising in precursors[:3]:
                     trend = "↑ rising" if rising else "— flat"
                     print(f"         {route}  MA={ma:.4f}%  {trend}")
+            agg = s.get('aggregate')
+            if agg:
+                a_trend = "↑ rising" if agg.get('rising') else "— flat"
+                print(f"      aggregate: mean MA={agg['mean_ma']:.4f}% "
+                      f"σ={agg['dispersion']:.4f}% routes={agg['route_count']}  {a_trend}")
             if s.get('book_thin'):
                 n = s['book_thin']
                 avg_fill = (s.get('book_thin_fill_sum', 0.0) / n) * 100
@@ -145,6 +174,9 @@ async def step_2_multi_async(manager, triangular_pairs):
                 print(f"      ⚠ {s['no_path']} pairs: triangle path logic did not match")
             elif s['no_path']:
                 print(f"      ⚠ {s['no_path']} pairs: no routable path (of {s['paths_evaluated']} evaluated)")
+
+    if LOG_AGGREGATE_CSV:
+        log_aggregate_csv(stats_by_exchange)
 
     if total_above_threshold:
         opp_num = 1

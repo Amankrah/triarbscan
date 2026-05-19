@@ -1,5 +1,6 @@
 import asyncio
 import aiohttp
+from collections import deque
 from typing import List, Dict
 from exchange_adapter import ExchangeAdapter
 from poloniex_adapter import PoloniexAdapter
@@ -21,6 +22,16 @@ ORDERBOOK_DEPTH = 100
 PRECURSOR_WINDOW = 10            # scans of surface history kept per cycle
 PRECURSOR_GATE_FRACTION = 0.5    # flag a cycle when its MA reaches this x the gate
 MAX_TICK_RATIO = 5e-5            # exclude a leg if one price tick >= this x mid price
+AGGREGATE_TREND_WINDOW = 20      # scans of aggregate-mean history for the trend
+
+
+def _series_rising(values) -> bool:
+    """True if the newer half of a series averages above the older half."""
+    vals = list(values)
+    if len(vals) < 4:
+        return False
+    half = len(vals) // 2
+    return sum(vals[half:]) / len(vals[half:]) > sum(vals[:half]) / len(vals[:half])
 
 # Currencies treated as 1:1 with USD when converting 24h volume.
 STABLE_USD = {
@@ -101,6 +112,8 @@ class MultiExchangeManager:
         self.adapters: Dict[str, ExchangeAdapter] = {}
         # Per-exchange surface-rate history; persists across scans.
         self._surface_trackers: Dict[str, SurfaceTracker] = {}
+        # Per-exchange history of the aggregate mean MA, for trend detection.
+        self._aggregate_history: Dict[str, deque] = {}
         if exchanges is None:
             exchanges = ['poloniex', 'binance', 'kraken', 'kucoin']
 
@@ -206,6 +219,7 @@ class MultiExchangeManager:
             'best_real_perc': None,
             'best_net_perc': None,
             'precursors': [],
+            'aggregate': None,
         }
         adapter = self.adapters.get(exchange.lower())
         if not adapter:
@@ -319,6 +333,17 @@ class MultiExchangeManager:
                 stats['precursors'] = tracker.precursors(
                     PRECURSOR_GATE_FRACTION * depth_gate
                 )
+
+            # Aggregate trajectory: mean/dispersion of MA across all routes,
+            # with a trend flag — separates venue-wide drift from lone spikes.
+            aggregate = tracker.aggregate()
+            if aggregate:
+                history = self._aggregate_history.setdefault(
+                    exchange.lower(), deque(maxlen=AGGREGATE_TREND_WINDOW)
+                )
+                history.append(aggregate['mean_ma'])
+                aggregate['rising'] = _series_rising(history)
+                stats['aggregate'] = aggregate
 
         return {'opportunities': opportunities, 'stats': stats}
 
