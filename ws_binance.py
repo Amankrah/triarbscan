@@ -35,10 +35,27 @@ class BinanceBookFeed:
         self._conns_up = 0
         self._tasks = []
         self._session = None
+        # Symbols whose book changed since the last consume_dirty() call.
+        # Single-threaded asyncio means no lock is needed — `_handle` and the
+        # scan loop never run concurrently. The event signals "at least one
+        # symbol moved" so the scanner can block instead of polling.
+        self._dirty: set = set()
+        self.update_event = asyncio.Event()
 
     @property
     def connected(self) -> bool:
         return self._conns > 0 and self._conns_up == self._conns
+
+    @property
+    def has_pending(self) -> bool:
+        return bool(self._dirty)
+
+    def consume_dirty(self) -> set:
+        """Return a snapshot of dirty symbols and clear the set + event."""
+        dirty = self._dirty
+        self._dirty = set()
+        self.update_event.clear()
+        return dirty
 
     async def start(self):
         self._session = aiohttp.ClientSession()
@@ -111,6 +128,8 @@ class BinanceBookFeed:
             self.messages += 1
         except (KeyError, ValueError, TypeError):
             return
+        self._dirty.add(norm)
+        self.update_event.set()
 
     def coverage(self, symbols) -> int:
         return sum(1 for s in symbols if s in self.books)
