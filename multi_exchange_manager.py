@@ -7,6 +7,7 @@ from binance_adapter import BinanceAdapter
 from kraken_adapter import KrakenAdapter
 from kucoin_adapter import KuCoinAdapter
 from fee_calculator import calculate_fee_impact
+from surface_tracker import SurfaceTracker
 import func_arbitrage
 
 STARTING_AMOUNTS = {"USDT": 100, "USDC": 100, "BTC": 0.05, "ETH": 0.1}
@@ -15,6 +16,11 @@ STARTING_AMOUNTS = {"USDT": 100, "USDC": 100, "BTC": 0.05, "ETH": 0.1}
 # notional on altcoin books — the walk runs off the end and the leg gets
 # silently scored as catastrophic. All four exchanges accept 100.
 ORDERBOOK_DEPTH = 100
+
+# Surface-rate precursor tracking — spot cycles trending toward the gate.
+PRECURSOR_WINDOW = 10            # scans of surface history kept per cycle
+PRECURSOR_GATE_FRACTION = 0.5    # flag a cycle when its MA reaches this x the gate
+MAX_TICK_RATIO = 5e-5            # exclude a leg if one price tick >= this x mid price
 
 # Currencies treated as 1:1 with USD when converting 24h volume.
 STABLE_USD = {
@@ -93,6 +99,8 @@ class MultiExchangeManager:
 
     def __init__(self, exchanges: List[str] = None):
         self.adapters: Dict[str, ExchangeAdapter] = {}
+        # Per-exchange surface-rate history; persists across scans.
+        self._surface_trackers: Dict[str, SurfaceTracker] = {}
         if exchanges is None:
             exchanges = ['poloniex', 'binance', 'kraken', 'kucoin']
 
@@ -197,6 +205,7 @@ class MultiExchangeManager:
             'best_surface_route': None,
             'best_real_perc': None,
             'best_net_perc': None,
+            'precursors': [],
         }
         adapter = self.adapters.get(exchange.lower())
         if not adapter:
@@ -205,6 +214,9 @@ class MultiExchangeManager:
         opportunities = []
         stats = dict(empty_stats)
         stats['pairs_checked'] = len(triangular_pairs)
+        tracker = self._surface_trackers.setdefault(
+            exchange.lower(), SurfaceTracker(PRECURSOR_WINDOW)
+        )
 
         async with aiohttp.ClientSession() as session:
             tickers = await adapter.get_all_tickers_async(session)
@@ -242,6 +254,11 @@ class MultiExchangeManager:
                                 or best_rate > stats['best_surface_perc']):
                             stats['best_surface_perc'] = best_rate
                             stats['best_surface_route'] = t_pair.get('combined')
+                        # Record the raw surface for trend tracking — but only
+                        # for cycles whose legs price finely enough that the
+                        # signal can move smoothly (no coarse-tick staircase).
+                        if self._cycle_smooth(t_pair, prices_dict, adapter):
+                            tracker.record(t_pair['combined'], best_rate)
                     else:
                         stats['no_path'] += 1
 
@@ -297,7 +314,28 @@ class MultiExchangeManager:
                     stats['last_error'] = f"{type(e).__name__}: {e}"
                     continue
 
+            # Cycles whose moving-average surface has built toward the gate.
+            if depth_gate > 0:
+                stats['precursors'] = tracker.precursors(
+                    PRECURSOR_GATE_FRACTION * depth_gate
+                )
+
         return {'opportunities': opportunities, 'stats': stats}
+
+    def _cycle_smooth(self, t_pair: Dict, prices_dict: Dict,
+                      adapter: ExchangeAdapter) -> bool:
+        """True if every leg prices finely enough to carry a real surface
+        signal — one price tick must be a small fraction of mid price. A
+        coarse-tick leg quantizes the surface into a staircase, so cycles
+        containing one are excluded from precursor tracking."""
+        for leg in ('a', 'b', 'c'):
+            tick = adapter.get_tick_size(t_pair[f"pair_{leg}"])
+            if not tick:
+                return False
+            mid = (prices_dict[f"pair_{leg}_ask"] + prices_dict[f"pair_{leg}_bid"]) / 2
+            if mid <= 0 or tick / mid >= MAX_TICK_RATIO:
+                return False
+        return True
 
     def _get_prices_for_pair(self, t_pair: Dict, ticker_dict: Dict) -> Dict:
         pair_a_data = ticker_dict.get(t_pair["pair_a"], {})

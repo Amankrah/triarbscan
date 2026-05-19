@@ -20,6 +20,14 @@ class ExchangeAdapter(ABC):
         # Subclasses populate these — from live API data where it is exposed.
         self.taker_fee: Optional[float] = None
         self.taker_fee_by_symbol: Dict[str, float] = {}
+        # Price tick (smallest price increment) per normalized symbol. Used to
+        # tell whether a leg's price can move smoothly — a coarse tick relative
+        # to price quantizes the surface signal into a staircase.
+        self.price_increment: Dict[str, float] = {}
+
+    def get_tick_size(self, symbol: str) -> Optional[float]:
+        """Smallest price increment for one pair, or None if unknown."""
+        return self.price_increment.get(symbol)
 
     def get_taker_fee(self, symbol: str) -> Optional[float]:
         """Taker fee (%) for one pair — per-symbol rate if known, else the

@@ -2,7 +2,9 @@ import asyncio
 import json
 import time
 
-from multi_exchange_manager import MultiExchangeManager
+from multi_exchange_manager import (
+    MultiExchangeManager, PRECURSOR_WINDOW, PRECURSOR_GATE_FRACTION,
+)
 
 # Poloniex dropped: at the volume floor it has only 1 liquid triangle —
 # not worth the ticker-fetch overhead. Its adapter is kept for later use.
@@ -97,7 +99,8 @@ async def step_2_multi_async(manager, triangular_pairs):
             best_s = s['best_surface_perc']
             best_r = s['best_real_perc']
             best_n = s.get('best_net_perc')
-            best_s_str = f"{best_s:.4f}%" if best_s is not None else "n/a"
+            best_s_str = (f"{best_s:.4f}% (raw {best_s:.8f}%)"
+                          if best_s is not None else "n/a")
             best_r_str = f"{best_r:.4f}%" if best_r is not None else "n/a"
             best_n_str = f"{best_n:.4f}%" if best_n is not None else "n/a"
             gate = s.get('depth_gate')
@@ -111,6 +114,15 @@ async def step_2_multi_async(manager, triangular_pairs):
             )
             if s.get('best_surface_route'):
                 print(f"      best-surface route: {s['best_surface_route']}")
+            precursors = s.get('precursors') or []
+            if precursors and gate is not None:
+                thr = gate * PRECURSOR_GATE_FRACTION
+                print(f"      ⚡ {len(precursors)} precursor cycle(s) — "
+                      f"{PRECURSOR_WINDOW}-scan MA ≥ {thr:.3f}% ("
+                      f"{PRECURSOR_GATE_FRACTION:g}× the {gate:.2f}% gate):")
+                for route, ma, rising in precursors[:3]:
+                    trend = "↑ rising" if rising else "— flat"
+                    print(f"         {route}  MA={ma:.4f}%  {trend}")
             if s.get('book_thin'):
                 n = s['book_thin']
                 avg_fill = (s.get('book_thin_fill_sum', 0.0) / n) * 100

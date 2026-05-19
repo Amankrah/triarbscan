@@ -28,25 +28,35 @@ class KuCoinAdapter(ExchangeAdapter):
         return self._extract_tickers(data)
 
     def _load_fee_map(self, symbols_data: Dict) -> None:
-        """Build per-pair taker fees from /api/v2/symbols. Each symbol carries
-        a feeCategory (1/2/3 -> Class A/B/C) and a taker fee coefficient (a
-        promotional multiplier, normally 1.0). On a failed fetch the previous
-        map is kept rather than wiped."""
+        """Build per-pair taker fees and price ticks from /api/v2/symbols. Each
+        symbol carries a feeCategory (1/2/3 -> Class A/B/C), a taker fee
+        coefficient (promotional multiplier, normally 1.0), and a
+        priceIncrement. On a failed fetch the previous maps are kept."""
         if not symbols_data or symbols_data.get('code') != '200000':
             return
         fees = {}
+        increments = {}
         for s in symbols_data.get('data', []):
             base, quote = s.get('baseCurrency'), s.get('quoteCurrency')
             if not base or not quote:
                 continue
+            symbol = f"{base}_{quote}"
             rate = KUCOIN_FEE_BY_CATEGORY.get(s.get('feeCategory'), self.taker_fee)
             try:
                 coef = float(s.get('takerFeeCoefficient') or 1.0)
             except (ValueError, TypeError):
                 coef = 1.0
-            fees[f"{base}_{quote}"] = rate * coef
+            fees[symbol] = rate * coef
+            try:
+                tick = float(s.get('priceIncrement') or 0)
+            except (ValueError, TypeError):
+                tick = 0
+            if tick:
+                increments[symbol] = tick
         if fees:
             self.taker_fee_by_symbol = fees
+        if increments:
+            self.price_increment = increments
 
     def _extract_tickers(self, data: Dict) -> List[Dict]:
         if not data or data.get('code') != '200000':

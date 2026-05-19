@@ -22,13 +22,40 @@ class BinanceAdapter(ExchangeAdapter):
         data = self.fetch_with_retry(f"{self.base_url}/ticker/24hr")
         if not data or not isinstance(data, list):
             return []
+        if not self.price_increment:        # static — fetch once, then cache
+            self._load_price_increments(self.fetch_with_retry(f"{self.base_url}/exchangeInfo"))
         return self._normalize_tickers(data)
 
     async def get_all_tickers_async(self, session: aiohttp.ClientSession) -> List[Dict]:
         data = await self.fetch_with_retry_async(session, f"{self.base_url}/ticker/24hr")
         if not data or not isinstance(data, list):
             return []
+        if not self.price_increment:        # static — fetch once, then cache
+            info = await self.fetch_with_retry_async(session, f"{self.base_url}/exchangeInfo")
+            self._load_price_increments(info)
         return self._normalize_tickers(data)
+
+    def _load_price_increments(self, exchange_info: Dict) -> None:
+        """Per-symbol price tick from exchangeInfo PRICE_FILTER. Static data,
+        so it is fetched once and cached for the process lifetime."""
+        if not exchange_info or 'symbols' not in exchange_info:
+            return
+        increments = {}
+        for s in exchange_info['symbols']:
+            base, quote = self.parse_symbol(s.get('symbol', ''))
+            if not base or not quote:
+                continue
+            for f in s.get('filters', []):
+                if f.get('filterType') == 'PRICE_FILTER':
+                    try:
+                        tick = float(f.get('tickSize') or 0)
+                    except (ValueError, TypeError):
+                        tick = 0
+                    if tick:
+                        increments[f"{base}_{quote}"] = tick
+                    break
+        if increments:
+            self.price_increment = increments
 
     def _normalize_tickers(self, data: list) -> List[Dict]:
         normalized = []

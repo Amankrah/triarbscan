@@ -65,6 +65,7 @@ class KrakenAdapter(ExchangeAdapter):
         of online pair names to query for tickers."""
         self._pair_meta = {}
         self._symbol_to_kraken = {}
+        self.price_increment = {}
         names = []
         live_taker_fee = None
         for kraken_name, info in pairs_result.items():
@@ -77,6 +78,9 @@ class KrakenAdapter(ExchangeAdapter):
                 continue
             if live_taker_fee is None:
                 live_taker_fee = self._entry_tier_fee(info.get('fees'))
+            tick = self._tick_size(info)
+            if tick:
+                self.price_increment[f"{base}_{quote}"] = tick
             self._pair_meta[kraken_name] = {
                 'base': base,
                 'quote': quote,
@@ -96,6 +100,24 @@ class KrakenAdapter(ExchangeAdapter):
             return float(fee_tiers[0][1])
         except (TypeError, IndexError, ValueError):
             return None
+
+    @staticmethod
+    def _tick_size(info):
+        """Price tick from an AssetPairs entry — the explicit `tick_size`
+        field, falling back to 10**-pair_decimals."""
+        ts = info.get('tick_size')
+        if ts is not None:
+            try:
+                return float(ts)
+            except (TypeError, ValueError):
+                pass
+        pd = info.get('pair_decimals')
+        if pd is not None:
+            try:
+                return 10.0 ** -int(pd)
+            except (TypeError, ValueError):
+                pass
+        return None
 
     def _clean_pair(self, info: Dict) -> Tuple[str, str]:
         """Derive human-readable (base, quote) from an AssetPairs entry,
