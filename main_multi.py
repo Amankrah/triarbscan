@@ -5,6 +5,7 @@ import time
 from multi_exchange_manager import MultiExchangeManager
 
 ENABLED_EXCHANGES = ['poloniex', 'binance', 'kraken', 'kucoin']
+MIN_USD_VOLUME = 50000   # drop pairs below this 24h USD volume (stale-quote ghosts)
 MIN_SURFACE_RATE = 0.0   # only fetch order books when surface profit >= this
 SLIPPAGE_BUFFER = 0.10   # % subtracted on top of fees — L20 book walks overstate fills
 MIN_NET_RATE = 0.0       # opportunity must clear fees + slippage by at least this %
@@ -25,7 +26,7 @@ def step_0_multi():
     exchange_tickers = manager.get_all_tickers_sync()
 
     print("\n🔍 Filtering tradeable pairs...")
-    tradeable_pairs = manager.get_tradeable_pairs(exchange_tickers)
+    tradeable_pairs = manager.get_tradeable_pairs(exchange_tickers, MIN_USD_VOLUME)
     total_pairs = sum(len(pairs) for pairs in tradeable_pairs.values())
     print(f"\n✓ Total tradeable pairs: {total_pairs}")
     return manager, tradeable_pairs, exchange_tickers
@@ -86,6 +87,8 @@ async def step_2_multi_async(manager, triangular_pairs):
                 f"thin={s.get('book_thin', 0)} empty={s.get('book_empty', 0)} | "
                 f"best surface={best_s_str} | best real={best_r_str} | best net={best_n_str}"
             )
+            if s.get('best_surface_route'):
+                print(f"      best-surface route: {s['best_surface_route']}")
             if s.get('book_thin'):
                 n = s['book_thin']
                 avg_fill = (s.get('book_thin_fill_sum', 0.0) / n) * 100

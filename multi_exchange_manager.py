@@ -16,6 +16,65 @@ STARTING_AMOUNTS = {"USDT": 100, "USDC": 100, "BTC": 0.05, "ETH": 0.1}
 # silently scored as catastrophic. All four exchanges accept 100.
 ORDERBOOK_DEPTH = 100
 
+# Currencies treated as 1:1 with USD when converting 24h volume.
+STABLE_USD = {
+    'USD', 'USDT', 'USDC', 'USDP', 'TUSD', 'BUSD', 'DAI', 'PAX', 'USDS', 'USD1',
+}
+
+
+def _build_usd_rates(tickers: List[Dict]) -> Dict[str, float]:
+    """USD value of one unit of each currency, read off <currency>_<stable>
+    tickers. Stablecoins map to 1.0; anything without a stable-quoted ticker
+    is simply absent (callers leave such pairs unfiltered)."""
+    rates: Dict[str, float] = {s: 1.0 for s in STABLE_USD}
+    for t in tickers:
+        symbol = t.get('symbol', '')
+        if '_' not in symbol:
+            continue
+        base, quote = symbol.split('_', 1)
+        try:
+            last = float(t.get('last') or 0)
+        except (ValueError, TypeError):
+            continue
+        if quote in STABLE_USD and base not in rates and last > 0:
+            rates[base] = last
+    return rates
+
+
+def filter_by_usd_volume(tickers: List[Dict], tradeable: List[str],
+                         min_usd_volume: float):
+    """Drop symbols whose 24h volume, converted to USD, is below the threshold.
+
+    `volume` is base-asset volume on all four adapters, so quote volume is
+    volume * last, then * the quote currency's USD rate. Pairs whose quote
+    cannot be priced in USD are kept (can't assess -> don't drop).
+
+    Returns (kept_symbols, dropped_count).
+    """
+    if min_usd_volume <= 0:
+        return tradeable, 0
+    rates = _build_usd_rates(tickers)
+    by_symbol = {t.get('symbol'): t for t in tickers}
+    kept, dropped = [], 0
+    for symbol in tradeable:
+        ticker = by_symbol.get(symbol)
+        if not ticker or '_' not in symbol:
+            kept.append(symbol)
+            continue
+        rate = rates.get(symbol.split('_', 1)[1])
+        if rate is None:
+            kept.append(symbol)               # quote not priceable in USD
+            continue
+        try:
+            usd_vol = float(ticker.get('volume') or 0) * float(ticker.get('last') or 0) * rate
+        except (ValueError, TypeError):
+            usd_vol = 0.0
+        if usd_vol >= min_usd_volume:
+            kept.append(symbol)
+        else:
+            dropped += 1
+    return kept, dropped
+
 
 class MultiExchangeManager:
 
@@ -63,14 +122,20 @@ class MultiExchangeManager:
             results_list = await asyncio.gather(*tasks)
             return dict(zip(names, results_list))
 
-    def get_tradeable_pairs(self, exchange_tickers: Dict[str, List[Dict]]) -> Dict[str, List[str]]:
+    def get_tradeable_pairs(self, exchange_tickers: Dict[str, List[Dict]],
+                            min_usd_volume: float = 0.0) -> Dict[str, List[str]]:
         results = {}
         for exchange, tickers in exchange_tickers.items():
             adapter = self.adapters.get(exchange)
             if adapter and tickers:
                 tradeable = adapter.get_tradeable_pairs(tickers)
-                results[exchange] = tradeable
-                print(f"  ✓ {exchange}: {len(tradeable)} tradeable pairs")
+                kept, dropped = filter_by_usd_volume(tickers, tradeable, min_usd_volume)
+                results[exchange] = kept
+                if dropped:
+                    print(f"  ✓ {exchange}: {len(kept)} tradeable pairs "
+                          f"({dropped} dropped: 24h volume < ${min_usd_volume:,.0f})")
+                else:
+                    print(f"  ✓ {exchange}: {len(kept)} tradeable pairs")
         return results
 
     def structure_triangular_pairs(self, tradeable_pairs: Dict[str, List[str]]) -> Dict[str, List[Dict]]:
@@ -106,6 +171,7 @@ class MultiExchangeManager:
             'errors': 0,
             'last_error': None,
             'best_surface_perc': None,
+            'best_surface_route': None,
             'best_real_perc': None,
             'best_net_perc': None,
         }
@@ -139,6 +205,7 @@ class MultiExchangeManager:
                         if (stats['best_surface_perc'] is None
                                 or best_rate > stats['best_surface_perc']):
                             stats['best_surface_perc'] = best_rate
+                            stats['best_surface_route'] = t_pair.get('combined')
                     else:
                         stats['no_path'] += 1
 
