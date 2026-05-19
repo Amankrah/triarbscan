@@ -43,7 +43,7 @@ from multi_exchange_manager import (
     AGGREGATE_TREND_WINDOW, _series_rising,
 )
 from surface_tracker import SurfaceTracker
-from ws_binance import BinanceBookFeed
+from ws_binance import BinanceBookFeed, BinanceDepthFeed
 import func_arbitrage
 
 if sys.platform == 'win32':
@@ -71,6 +71,7 @@ STARTING_AMOUNTS = {"USDT": 100, "USDC": 100, "BTC": 0.05, "ETH": 0.1}
 EVENT_SCAN_HZ = 20              # max scans per second (50 ms floor between scans)
 AGGREGATE_LOG_SECONDS = 1.0     # slow-tick interval: tracker, aggregate, CSV
 HEARTBEAT_SECONDS = 5.0         # console summary cadence
+ENABLE_L2_WATCHLIST = True      # Phase 3: stream L2 depth for precursor cycles
 
 LOG_AGGREGATE_CSV = True
 LOG_ARRIVAL_EVENTS = True
@@ -81,6 +82,15 @@ EVENT_CSV_PREFIX = 'arrival_events_ws'
 # ============================================================
 # helpers
 # ============================================================
+
+def _fmt_age(age):
+    """Format a quote-age (seconds) compactly: sub-second in ms, else seconds."""
+    if age is None:
+        return "n/a"
+    if age < 1.0:
+        return f"{age * 1000:.0f}ms"
+    return f"{age:.1f}s"
+
 
 def _cycle_smooth(t_pair, prices, adapter):
     """True only if every leg's price tick is small relative to mid. Coarse-
@@ -208,15 +218,29 @@ def _l1_orderbook(sym, books):
             'asks': [[bk['ask'], bk['ask_qty']]]}
 
 
-def _real_rate(surface_arb, books):
-    """Reordered, fill-fraction-aware depth walk over the L1 mirror.
+def _select_book(sym, books_l1, books_l2):
+    """Prefer the L2 partial-book snapshot if a fresh one is available for
+    this symbol; otherwise fall back to the L1 inside-quote mirror. Returns
+    (book, used_l2: bool)."""
+    if books_l2 is not None:
+        bk = books_l2.get(sym)
+        if bk and bk.get('bids') and bk.get('asks'):
+            return bk, True
+    return _l1_orderbook(sym, books_l1), False
+
+
+def _real_rate(surface_arb, books_l1, books_l2):
+    """Reordered, fill-fraction-aware depth walk that prefers L2 partial-book
+    snapshots where the watchlist has them and falls back to the L1 inside
+    quote otherwise.
 
     The surface calc records correct legs but not in executable order, and
     its `swap_1` is mislabeled (manuscript §3.2). We reorder via the
     produce/consume chain and recover the true start currency before walking.
-    Returns a dict carrying (profit, real_rate_perc, contracts in execution
-    order, swap_1) on a clean fill, or {'exhausted': True, 'filled_fraction':
-    f, ...} on a partial fill, or None when the legs do not close."""
+    Returns a dict with `legs_l2` (count of legs that used L2). On a clean
+    fill the dict carries `profit` and `real_rate_perc`; on a partial fill
+    it carries `exhausted=True` and `filled_fraction`; None when the legs
+    do not close."""
     raw_legs = [
         (surface_arb['contract_1'], surface_arb['direction_trade_1']),
         (surface_arb['contract_2'], surface_arb['direction_trade_2']),
@@ -227,8 +251,15 @@ def _real_rate(surface_arb, books):
         return None
     contracts = [c for c, _ in legs]
     directions = [d for _, d in legs]
-    depths = [func_arbitrage.reformated_orderbook(_l1_orderbook(c, books), d)
-              for c, d in zip(contracts, directions)]
+
+    legs_l2 = 0
+    depths = []
+    for contract, direction in zip(contracts, directions):
+        book, used_l2 = _select_book(contract, books_l1, books_l2)
+        if used_l2:
+            legs_l2 += 1
+        depths.append(func_arbitrage.reformated_orderbook(book, direction))
+
     start = STARTING_AMOUNTS.get(swap_1, 100)
     amount = start
     for leg_idx, depth in enumerate(depths, start=1):
@@ -236,27 +267,31 @@ def _real_rate(surface_arb, books):
         if filled < 1.0:
             return {'exhausted': True, 'filled_fraction': filled,
                     'exhausted_leg': leg_idx,
-                    'contracts': contracts, 'swap_1': swap_1}
+                    'contracts': contracts, 'swap_1': swap_1,
+                    'legs_l2': legs_l2}
     profit = amount - start
     real_perc = (profit / start * 100) if start else 0
     return {'exhausted': False, 'profit': profit, 'real_rate_perc': real_perc,
-            'contracts': contracts, 'swap_1': swap_1}
+            'contracts': contracts, 'swap_1': swap_1,
+            'legs_l2': legs_l2}
 
 
 # ============================================================
 # scan
 # ============================================================
 
-def scan(triangles, books, adapter, depth_gate, *,
+def scan(triangles, books_l1, books_l2, adapter, depth_gate, *,
          tracker=None, prev_above_gate=None):
     """One pass over the cached triangle set against the live book mirror.
 
-    Returns `(opportunities, stats, events)`.
+    `books_l1` is the inside-quote mirror (bookTicker). `books_l2` is the
+    partial-book snapshots for the precursor watchlist (or None to disable).
+    The depth walk uses L2 where available and falls back to L1 otherwise.
 
-    `events` carries one entry per gate-crossing detected against
-    `prev_above_gate` (a mutable dict mapping route -> bool). Pass it across
-    scans to detect transitions; this routine mutates it in place. With
-    `tracker`, records eligible cycles to the SurfaceTracker (slow tick)."""
+    Returns `(opportunities, stats, events)`. `events` carries one entry per
+    gate-crossing detected against `prev_above_gate` (a mutable route->bool
+    dict the routine updates in place). With `tracker`, records eligible
+    cycles to the SurfaceTracker (slow tick)."""
     opportunities = []
     events = []
     stats = {
@@ -268,11 +303,12 @@ def scan(triangles, books, adapter, depth_gate, *,
         'best_surface_perc': None, 'best_surface_route': None,
         'best_real_perc': None, 'best_net_perc': None,
         'depth_gate': depth_gate,
+        'l2_legs_used': 0, 'l2_full_cycles': 0,
     }
 
     for t_pair in triangles:
         combined = t_pair.get('combined', '')
-        prices = _prices(t_pair, books)
+        prices = _prices(t_pair, books_l1)
         if prices is None:
             stats['missing_prices'] += 1
             continue
@@ -300,7 +336,14 @@ def scan(triangles, books, adapter, depth_gate, *,
 
         if gate_crossed:
             stats['depth_checked'] += 1
-            result = _real_rate(surface_arb, books)
+            result = _real_rate(surface_arb, books_l1, books_l2)
+            if result is None:
+                pass
+            else:
+                legs_l2 = result.get('legs_l2', 0)
+                stats['l2_legs_used'] += legs_l2
+                if legs_l2 == 3:
+                    stats['l2_full_cycles'] += 1
             if result is None:
                 pass
             elif result.get('exhausted'):
@@ -369,7 +412,7 @@ def scan(triangles, books, adapter, depth_gate, *,
 # ============================================================
 
 def _print_heartbeat(scan_count, events_logged, compute_samples,
-                     stats, agg, feed, symbols, gate, opportunities):
+                     stats, agg, feed, depth_feed, symbols, gate, opportunities):
     print(f"\n>>> HEARTBEAT scan #{scan_count} at {time.strftime('%H:%M:%S')}")
     print("=" * 60)
 
@@ -395,7 +438,15 @@ def _print_heartbeat(scan_count, events_logged, compute_samples,
         print(f"             best surface={best_s_str} | "
               f"best real={best_r_str} | best net={best_n_str}")
         if stats.get('best_surface_route'):
-            print(f"  best-surface route: {stats['best_surface_route']}")
+            route = stats['best_surface_route']
+            print(f"  best-surface route: {route}")
+            # Per-leg quote staleness — a leg whose inside price hasn't
+            # moved for many seconds while the others tick smoothly is the
+            # signature of quote-refresh sparsity pinning the surface.
+            legs = route.split(',')
+            if len(legs) == 3:
+                parts = [f"{leg}={_fmt_age(feed.quote_age(leg))}" for leg in legs]
+                print(f"    leg quote ages: {' | '.join(parts)}")
 
     if agg:
         a_trend = "↑ rising" if agg.get('rising') else "— flat"
@@ -410,8 +461,16 @@ def _print_heartbeat(scan_count, events_logged, compute_samples,
               f"samples n={len(samples)}")
 
     conn = "connected" if feed.connected else "DISCONNECTED"
-    print(f"  feed: {feed.coverage(symbols)}/{len(symbols)} symbols | "
+    print(f"  feed L1: {feed.coverage(symbols)}/{len(symbols)} symbols | "
           f"ws msgs={feed.messages} | {conn}")
+    if depth_feed is not None:
+        d_conn = "connected" if depth_feed.connected else "DISCONNECTED"
+        l2_used = (stats.get('l2_legs_used', 0) if stats else 0)
+        l2_full = (stats.get('l2_full_cycles', 0) if stats else 0)
+        print(f"  feed L2: watchlist={len(depth_feed._target)} symbols, "
+              f"{len(depth_feed.depth_books)} snapshots | "
+              f"ws msgs={depth_feed.messages} | {d_conn} | "
+              f"last scan: {l2_full} cycles fully on L2, {l2_used} legs")
 
     if opportunities:
         for i, opp in enumerate(opportunities, 1):
@@ -434,7 +493,7 @@ def _print_heartbeat(scan_count, events_logged, compute_samples,
 
 async def run():
     print("=" * 60)
-    print("WEBSOCKET TRIANGULAR ARBITRAGE SCANNER — BINANCE  (Phase 2)")
+    print("WEBSOCKET TRIANGULAR ARBITRAGE SCANNER — BINANCE  (Phase 3)")
     print("=" * 60)
     print(f"Min NET: {MIN_NET_RATE}% (after {FEE_TYPE} fees + {SLIPPAGE_BUFFER}% slippage)")
     print(f"Event-driven recompute, up to {EVENT_SCAN_HZ} Hz. Aggregate slow-tick: "
@@ -460,16 +519,26 @@ async def run():
     prev_precursors: set = set()
     events_logged: Counter = Counter()
     compute_samples = deque(maxlen=500)
+    # Maps the route key used by precursor tracking back to the triangle dict,
+    # so the L2 watchlist can be derived from the precursor set.
+    combined_to_triangle = {t['combined']: t for t in triangles}
 
     feed = BinanceBookFeed(symbols, initial_books=snapshot)
+    depth_feed = BinanceDepthFeed() if ENABLE_L2_WATCHLIST else None
+
     await feed.start()
-    print("\n📡 WebSocket feed started — subscribing to per-symbol streams...")
+    print("\n📡 L1 feed started — subscribing to per-symbol bookTicker streams...")
     for _ in range(50):
         await asyncio.sleep(0.2)
         if feed.connected and feed.messages > 0:
             break
-    print(f"  ✓ feed connected={feed.connected} | "
+    print(f"  ✓ L1 connected={feed.connected} | "
           f"{feed.coverage(symbols)}/{len(symbols)} symbols covered")
+
+    if depth_feed is not None:
+        await depth_feed.start()
+        print(f"📡 L2 depth feed started — partial-book depth{20}@100ms; "
+              f"watchlist initially empty (filled by precursor tracking).")
 
     print(f"\nEvent-driven scanning (Ctrl+C to stop)")
     print(f"  arrival events -> {EVENT_CSV_PREFIX}_*.csv | "
@@ -502,7 +571,9 @@ async def run():
 
             t0 = time.perf_counter()
             opportunities, stats, events = scan(
-                triangles, feed.books, adapter, depth_gate,
+                triangles, feed.books,
+                depth_feed.depth_books if depth_feed is not None else None,
+                adapter, depth_gate,
                 tracker=tracker if slow_this else None,
                 prev_above_gate=prev_above_gate,
             )
@@ -556,14 +627,26 @@ async def run():
                             events_logged['precursor_exit'] += 1
                     prev_precursors = new_routes
 
+                    # Drive the L2 watchlist from the current precursor set:
+                    # every symbol that appears in any precursor route gets
+                    # streamed at L2. set_watchlist is idempotent and diffs
+                    # internally, so calling every slow tick is cheap.
+                    if depth_feed is not None:
+                        watchlist = set()
+                        for route in new_routes:
+                            tr = combined_to_triangle.get(route)
+                            if tr:
+                                watchlist.update((tr['pair_a'], tr['pair_b'], tr['pair_c']))
+                        await depth_feed.set_watchlist(watchlist)
+
                 if LOG_AGGREGATE_CSV and last_agg:
                     log_aggregate_csv({'aggregate': last_agg})
 
             # Console heartbeat.
             if last_scan_t - last_heartbeat >= HEARTBEAT_SECONDS:
                 _print_heartbeat(scan_count, events_logged, compute_samples,
-                                 last_stats, last_agg, feed, symbols,
-                                 depth_gate, last_opportunities)
+                                 last_stats, last_agg, feed, depth_feed,
+                                 symbols, depth_gate, last_opportunities)
                 last_heartbeat = last_scan_t
 
     except (KeyboardInterrupt, asyncio.CancelledError):
@@ -571,6 +654,8 @@ async def run():
               f"Events: {dict(events_logged)}")
     finally:
         await feed.stop()
+        if depth_feed is not None:
+            await depth_feed.stop()
 
 
 if __name__ == "__main__":
