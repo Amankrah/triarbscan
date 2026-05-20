@@ -8,9 +8,10 @@ diagnostics. Each venue logs to its own daily-rotated CSV pair
 `arrival_events_ws_<venue>_*.csv`) so the venues can be analysed
 independently without joining on `exchange` column.
 
-L2 partial-book streaming (Phase 3) remains a Binance-only enhancement —
-adding L2 for Kraken / KuCoin is mechanically straightforward with each
-venue's depth channel and can be the next layer.
+L2 partial-book streaming (Phase 3) runs on all three venues, each via the
+venue's depth channel: Binance `depth20@100ms` (snapshot+diff), Kraken v2
+`book` channel (snapshot+diff), KuCoin `/spotMarket/level2Depth50` (full
+snapshot push every ~100 ms).
 
 A combined heartbeat (every 5 s) prints a per-venue stanza covering events,
 last-scan diagnostics, the best-surface route with leg quote-ages, the
@@ -28,8 +29,8 @@ from binance_adapter import BinanceAdapter
 from kraken_adapter import KrakenAdapter
 from kucoin_adapter import KuCoinAdapter
 from ws_binance import BinanceBookFeed, BinanceDepthFeed
-from ws_kraken import KrakenBookFeed
-from ws_kucoin import KuCoinBookFeed
+from ws_kraken import KrakenBookFeed, KrakenDepthFeed
+from ws_kucoin import KuCoinBookFeed, KuCoinDepthFeed
 from surface_tracker import SurfaceTracker
 from multi_exchange_manager import (
     filter_by_usd_volume,
@@ -62,7 +63,7 @@ MIN_USD_VOLUME_BY_QUOTE = {
 EVENT_SCAN_HZ = 20
 AGGREGATE_LOG_SECONDS = 1.0
 HEARTBEAT_SECONDS = 5.0
-ENABLE_L2_WATCHLIST = True       # Binance only
+ENABLE_L2_WATCHLIST = True       # all three venues
 
 LOG_AGGREGATE_CSV = True
 
@@ -213,7 +214,8 @@ async def venue_scan_loop(venue, ctx):
                 prev_precursors.clear()
                 prev_precursors.update(new_routes)
 
-                # L2 watchlist (Binance only — depth_feed is None elsewhere)
+                # L2 watchlist — all three venues now expose a depth_feed
+                # when ENABLE_L2_WATCHLIST is on; otherwise depth_feed is None.
                 if depth_feed is not None:
                     watchlist = set()
                     for route in new_routes:
@@ -349,10 +351,12 @@ async def run():
             depth_feed = BinanceDepthFeed() if ENABLE_L2_WATCHLIST else None
         elif venue == 'kraken':
             feed = KrakenBookFeed(symbols, adapter._symbol_to_wsname)
-            depth_feed = None
+            depth_feed = (KrakenDepthFeed(adapter._symbol_to_wsname)
+                          if ENABLE_L2_WATCHLIST else None)
         elif venue == 'kucoin':
             feed = KuCoinBookFeed(symbols)
-            depth_feed = None
+            depth_feed = (KuCoinDepthFeed(symbols)
+                          if ENABLE_L2_WATCHLIST else None)
         venue_ctxs[venue] = {
             'adapter': adapter,
             'triangles': triangles,
