@@ -17,8 +17,9 @@ class KrakenAdapter(ExchangeAdapter):
         # cannot be reliably reconstructed from a normalized BASE_QUOTE symbol
         # (legacy X/Z asset prefixes are ambiguous), so we keep the exact
         # names the API gave us rather than guessing them.
-        self._pair_meta: Dict[str, Dict[str, str]] = {}   # kraken name -> {base, quote, altname}
+        self._pair_meta: Dict[str, Dict[str, str]] = {}   # kraken name -> {base, quote, altname, wsname}
         self._symbol_to_kraken: Dict[str, str] = {}        # BASE_QUOTE -> kraken depth name
+        self._symbol_to_wsname: Dict[str, str] = {}        # BASE_QUOTE -> "XBT/USD"-style WS id
         # Verified fallback; overwritten each ticker fetch with the live
         # entry-tier rate from AssetPairs (Kraken's schedule is account-wide).
         self.taker_fee = 0.40
@@ -65,6 +66,7 @@ class KrakenAdapter(ExchangeAdapter):
         of online pair names to query for tickers."""
         self._pair_meta = {}
         self._symbol_to_kraken = {}
+        self._symbol_to_wsname = {}
         self.price_increment = {}
         names = []
         live_taker_fee = None
@@ -85,6 +87,10 @@ class KrakenAdapter(ExchangeAdapter):
                 'base': base,
                 'quote': quote,
                 'altname': info.get('altname') or kraken_name,
+                # `wsname` is the Kraken WebSocket subscription identifier
+                # ("XBT/USD"); kept verbatim from AssetPairs so the v2 ticker
+                # channel can be subscribed without reconstruction.
+                'wsname': info.get('wsname') or '',
             }
             names.append(kraken_name)
         if live_taker_fee is not None:
@@ -160,6 +166,8 @@ class KrakenAdapter(ExchangeAdapter):
                 continue
             symbol = f"{meta['base']}_{meta['quote']}"
             self._symbol_to_kraken[symbol] = meta['altname']
+            if meta.get('wsname'):
+                self._symbol_to_wsname[symbol] = meta['wsname']
             normalized.append({
                 'symbol': symbol,
                 'bid': bid,

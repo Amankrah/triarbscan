@@ -105,36 +105,43 @@ def _cycle_smooth(t_pair, prices, adapter):
     return True
 
 
-def log_aggregate_csv(stats):
-    """Append the slow-tick aggregate row to a daily-rotated WS-specific CSV."""
+def log_aggregate_csv(stats, exchange='binance', csv_prefix=None):
+    """Append the slow-tick aggregate row to a daily-rotated CSV. `exchange`
+    is recorded in the row; `csv_prefix` selects the file (defaults to the
+    single-venue Binance prefix for backward compat)."""
     agg = stats.get('aggregate')
     if not agg:
         return
+    if csv_prefix is None:
+        csv_prefix = AGGREGATE_CSV_PREFIX
     now = datetime.now()
-    path = f"{AGGREGATE_CSV_PREFIX}_{now:%Y-%m-%d}.csv"
+    path = f"{csv_prefix}_{now:%Y-%m-%d}.csv"
     new_file = not os.path.exists(path)
     with open(path, 'a', newline='') as fp:
         writer = csv.writer(fp)
         if new_file:
             writer.writerow(['timestamp', 'exchange', 'mean_ma',
                              'dispersion', 'route_count'])
-        writer.writerow([now.isoformat(timespec='seconds'), 'binance',
+        writer.writerow([now.isoformat(timespec='seconds'), exchange,
                          f"{agg['mean_ma']:.8f}",
                          f"{agg['dispersion']:.8f}",
                          agg['route_count']])
 
 
-def log_event(event):
+def log_event(event, exchange='binance', csv_prefix=None):
     """Append one arrival-process event to a daily-rotated event log.
 
     `event` is a dict with 'type', 'route', and optional 'surface_perc',
     'real_perc', 'net_perc', 'filled_fraction', and 'timestamp' (datetime).
     Timestamp is recorded to millisecond precision so inter-event times can
-    be reconstructed even at high cadence."""
+    be reconstructed even at high cadence. `exchange` is recorded in the
+    row; `csv_prefix` selects the file (defaults to single-venue Binance)."""
     if not LOG_ARRIVAL_EVENTS:
         return
+    if csv_prefix is None:
+        csv_prefix = EVENT_CSV_PREFIX
     now = event.get('timestamp') or datetime.now()
-    path = f"{EVENT_CSV_PREFIX}_{now:%Y-%m-%d}.csv"
+    path = f"{csv_prefix}_{now:%Y-%m-%d}.csv"
     new_file = not os.path.exists(path)
     with open(path, 'a', newline='') as fp:
         writer = csv.writer(fp)
@@ -148,7 +155,7 @@ def log_event(event):
 
         writer.writerow([
             now.isoformat(timespec='milliseconds'),
-            'binance', event['type'], event.get('route', ''),
+            exchange, event['type'], event.get('route', ''),
             fmt(event.get('surface_perc')),
             fmt(event.get('real_perc')),
             fmt(event.get('net_perc')),
@@ -281,7 +288,7 @@ def _real_rate(surface_arb, books_l1, books_l2):
 # ============================================================
 
 def scan(triangles, books_l1, books_l2, adapter, depth_gate, *,
-         tracker=None, prev_above_gate=None):
+         tracker=None, prev_above_gate=None, exchange='binance'):
     """One pass over the cached triangle set against the live book mirror.
 
     `books_l1` is the inside-quote mirror (bookTicker). `books_l2` is the
@@ -362,7 +369,7 @@ def scan(triangles, books_l1, books_l2, adapter, depth_gate, *,
                     stats['best_real_perc'] = real
                 fee_3 = sum(adapter.get_taker_fee(c) or 0.0
                             for c in result['contracts'])
-                fee = calculate_fee_impact('binance', real, FEE_TYPE,
+                fee = calculate_fee_impact(exchange, real, FEE_TYPE,
                                            total_fee_perc=fee_3)
                 net = (fee['net_profit_perc'] or 0) - SLIPPAGE_BUFFER
                 net_value = net
@@ -373,7 +380,7 @@ def scan(triangles, books_l1, books_l2, adapter, depth_gate, *,
                                 'fee_perc': fee['total_fee_3_trades']}
                 if net >= MIN_NET_RATE:
                     opportunities.append({
-                        'exchange': 'binance',
+                        'exchange': exchange,
                         'contract_1': result['contracts'][0],
                         'contract_2': result['contracts'][1],
                         'contract_3': result['contracts'][2],
