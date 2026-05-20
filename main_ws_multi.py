@@ -17,6 +17,7 @@ last-scan diagnostics, the best-surface route with leg quote-ages, the
 aggregate trajectory, and feed health.
 """
 import asyncio
+import json
 import statistics
 import sys
 import time
@@ -325,6 +326,12 @@ async def run():
     for v, (_, tri, syms, snap, raw, kept, dropped) in boots.items():
         print(f"  [{v}] {raw} tradeable -> {kept} after volume filter (dropped {dropped}) | "
               f"{len(tri)} triangles | {len(syms)} symbols | seeded {len(snap)} L1 books")
+    # Persist each venue's triangle set, matching the REST scanner's artifact.
+    for v, (_, tri, _, _, _, _, _) in boots.items():
+        fname = f"triangular_pairs_{v}.json"
+        with open(fname, "w") as fp:
+            json.dump(tri, fp, indent=2)
+        print(f"  💾 saved {len(tri)} {v} triangles -> {fname}")
 
     # Build per-venue context
     venue_ctxs = {}

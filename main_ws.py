@@ -28,6 +28,7 @@ the next phase.
 """
 import asyncio
 import csv
+import json
 import os
 import statistics
 import sys
@@ -182,6 +183,11 @@ def bootstrap():
     print(f"  ✓ {len(pairs_raw)} tradeable -> {len(pairs)} after volume filter "
           f"(dropped {dropped}) | {len(triangles)} triangles | "
           f"{len(symbols)} symbols | seeded {len(snapshot)} books")
+    # Persist the triangle set, matching the REST scanner's artifact.
+    fname = "triangular_pairs_binance.json"
+    with open(fname, "w") as fp:
+        json.dump(triangles, fp, indent=2)
+    print(f"  💾 saved {len(triangles)} triangles -> {fname}")
     return adapter, triangles, symbols, snapshot
 
 
